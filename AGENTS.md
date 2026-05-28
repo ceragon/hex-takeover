@@ -133,9 +133,6 @@ initGameState() → main loop → UI/render → click handling → tests
 ## Known Pitfalls
 
 <!-- Keep updated, max ~8-9 entries -->
-- **Playwright browser_click params:** `browser_click` requires `element` (description) and `target` (snapshot ref), not `ref`. Wrong param → `expected string, received undefined`, causes retry loop in auto mode.
-- **Initialization order conflict:** `initGameState()` before module definitions → `Cannot access before initialization`. 修复：严格按上文 "v2 推荐模块顺序" 在 GameState init 之前插入模块。
-- **GameLoop assertion timing:** `console.assert(tickCount > 0)` fails synchronously — use `setTimeout(..., 200)`.
 - **v2 格子状态机易混淆：** 格子有 3 种状态（未激活 / 可开 / 已开）× 4 种图标（? / 头盔 / 盾牌 / 金属）× 多种已开结果。状态转换必须单向，回退会引发 bug。
 - **v2 混合池 + 二次概率的 seed 管理：** 随机分两层（混合池选图标 → 档位选品质），必须用同一个 seeded RNG 实例贯穿两层，否则 replay 不可复现。
 - **v2 HexGrid flat-top 坐标 parity 易错：** `axialToPixel` 用 `sqrt(3)/2 * r` 隐式实现 RedBlob 的 odd-r 约定（奇数行右移半格），但 even/odd 行的 6 向邻居偏移集合不同。改邻居或寻路前**先用 `Math.hypot` 实测像素距离**（距离 ≈ size·√3 的才是真邻居，2·size 的不是），不要信记忆里的 offset 表。
@@ -143,6 +140,9 @@ initGameState() → main loop → UI/render → click handling → tests
 - **v2 HQ 不能放在地图边缘行：** HexGrid 9×13 中 r=0 和 r=12 是边缘行，HQ 在这些位置只有 4 个邻居（而非 6 个），导致 OpeningLayout 无法生成完整的 6 格开局。**HQ 应放在 r=1 和 r=11（或更内侧）**，确保 6 个邻居都在界内。
 - **v2 OpeningLayout 金矿概率数学：** P(≥1 金矿 in 6 slots) = 1 - (1-p)^6。要得到 70%，需 p ≈ 18%（即 0.82^6 ≈ 0.30），**不是**直觉上的 35%（0.65^6 ≈ 0.075，实际给 92.5%）。指数衰减很容易误算，改权重前先手算验证。
 - **v2 统计测试必须用 SeededRNG：** 简单 LCG mock `(s * 1103515245 + 12345) & 0x7fffffff` 低位比特周期短，weightedPick 分布严重偏移（如预期 70% 金矿实测 93%）。统计检验**必须用 SeededRNG（mulberry32）+ 不同 seed**，不要用临时 LCG mock。
+- **v2 `activateOpenableTiles` 必须对 tiles[hexId] 做 undefined 守卫：** 循环 `for (hexId of Object.keys(tiles))` 拿到的 key 对应的 tile 可能是 `undefined`（ClickHandler 等测试用"仅含少量键"的孤立 tiles dict 调用时），访问 `tile.state` 会抛 `Cannot read properties of undefined (reading 'state')`，且错误栈无模块定位。**修复：循环第一句加 `if (!tile) continue`**。
+- **Playwright 坐标系统：canvas-offset vs viewport-offset：** `page.mouse.click(x, y)` 接收 viewport 坐标（相对于视口左上角），不是 canvas 内部像素坐标。第一版 E2E 脚本把 probe 写成 canvas 内坐标直调，所有 click 都落到 canvas 外导致"找不到可点格子"。**正确写法**：`const box = await canvas.boundingBox(); await page.mouse.click(box.x + canvasOffsetX, box.y + canvasOffsetY)`。
+- **Playwright E2E 中 ResourceSystem.tick 造成 gold 数值噪声：** 10Hz 主循环在游戏启动后一直跑，HQ 每 6 秒 +12 金（金矿 +10）。E2E probe 耗时数秒，"gold 变化 = 开格子" 的断言会被收入 tick 污染（如 60→875 看似离谱实为收入 + 多次开启）。**应对**：E2E 只断言"行为发生"（state 翻转 / tile 数量 / gold 方向），精确数值断言留给纯逻辑 IIFE 测试。
 
 ## Core Numbers
 
