@@ -166,17 +166,53 @@ const TileReveal = {
     return { tiles, playerBase: playerBaseKey, aiBase: aiBaseKey };
   },
 
-  // 尝试翻牌：消耗金币，返回翻牌结果
-  reveal(tileKey, tiles, playerGold, cost = 10) {
+  // 尝试翻牌：返回翻牌结果（不做金币检查，由 ResourceSystem 处理）
+  reveal(tileKey, tiles) {
     const tile = tiles[tileKey];
     if (!tile || tile.revealed) {
       return { success: false, reason: tile ? 'already revealed' : 'invalid tile' };
     }
-    if (playerGold < cost) {
+    tile.revealed = true;
+    return { success: true, tileType: tile.type };
+  }
+};
+
+// ============================================================
+// ResourceSystem: 金币收入/支出、金矿产出
+// ============================================================
+const ResourceSystem = {
+  REVEAL_COST: 10,
+  MINE_BONUS: 50,       // 翻出金矿立即获得
+  MINE_INCOME: 5,       // 每秒每个金矿产出
+  INCOME_INTERVAL: 1000, // 1Hz tick 间隔(ms)
+
+  // 创建资源状态
+  create(initialGold = 50) {
+    return { gold: initialGold, mineCount: 0 };
+  },
+
+  // 尝试翻牌：消耗金币，返回结果
+  tryReveal(resources) {
+    if (resources.gold < this.REVEAL_COST) {
       return { success: false, reason: 'not enough gold' };
     }
-    tile.revealed = true;
-    return { success: true, newGold: playerGold - cost, tileType: tile.type };
+    resources.gold -= this.REVEAL_COST;
+    return { success: true };
+  },
+
+  // 翻出金矿：立即获得启动资金 + 记录金矿数量
+  onMineRevealed(resources) {
+    resources.gold += this.MINE_BONUS;
+    resources.mineCount++;
+  },
+
+  // 1Hz tick：根据金矿数量产出金币
+  tick(resources) {
+    const income = resources.mineCount * this.MINE_INCOME;
+    if (income > 0) {
+      resources.gold += income;
+    }
+    return income;
   }
 };
 
@@ -221,19 +257,14 @@ const TileReveal = {
   // 测试其他格子初始为迷雾
   console.assert(map1.tiles['0,1'].revealed === false, 'Non-base tiles should start as fog');
 
-  // 测试翻牌消耗
-  const result = TileReveal.reveal('0,1', map1.tiles, 15);
-  console.assert(result.success === true, 'Reveal with enough gold should succeed');
-  console.assert(result.newGold === 5, 'Gold should be reduced by 10');
+  // 测试翻牌消耗（金币检查由 ResourceSystem 处理，这里只测状态变更）
+  const result = TileReveal.reveal('0,1', map1.tiles);
+  console.assert(result.success === true, 'Reveal un-revealed tile should succeed');
+  console.assert(result.tileType !== undefined, 'Result should include tileType');
   console.assert(map1.tiles['0,1'].revealed === true, 'Tile should be revealed after success');
 
-  // 测试金币不足
-  const failResult = TileReveal.reveal('1,1', map1.tiles, 5);
-  console.assert(failResult.success === false, 'Reveal with insufficient gold should fail');
-  console.assert(failResult.reason === 'not enough gold', 'Fail reason should be "not enough gold"');
-
   // 测试已翻牌
-  const dupResult = TileReveal.reveal('0,1', map1.tiles, 100);
+  const dupResult = TileReveal.reveal('0,1', map1.tiles);
   console.assert(dupResult.success === false, 'Revealing already revealed tile should fail');
 
   console.log('[test] TileReveal tests passed');
@@ -249,8 +280,9 @@ const MAP_SEED = 42;
 function initGameState() {
   const map = TileReveal.generateMap(MAP_COLS, MAP_ROWS, MAP_SEED);
   return {
-    playerGold: 50,  // 初始金币
-    aiGold: 50,
+    playerResources: ResourceSystem.create(50),
+    aiResources: ResourceSystem.create(50),
+    lastIncomeTime: 0,
     ...map
   };
 }
@@ -261,8 +293,8 @@ let gameState = initGameState();
 // UI update
 // ============================================================
 function updateUI() {
-  document.getElementById('player-gold').textContent = `玩家: ${gameState.playerGold} 金`;
-  document.getElementById('ai-gold').textContent = `AI: ${gameState.aiGold} 金`;
+  document.getElementById('player-gold').textContent = `玩家: ${gameState.playerResources.gold} 金`;
+  document.getElementById('ai-gold').textContent = `AI: ${gameState.aiResources.gold} 金`;
 }
 
 // ============================================================
@@ -360,23 +392,26 @@ canvas.addEventListener('click', (event) => {
   const mx = event.clientX - rect.left;
   const my = event.clientY - rect.top;
 
-  // Find which hex was clicked
   const clickedHex = findHexAt(mx, my);
   if (!clickedHex) return;
 
   const tileKey = `${clickedHex.q},${clickedHex.r}`;
-  const result = TileReveal.reveal(tileKey, gameState.tiles, gameState.playerGold);
+  const tile = gameState.tiles[tileKey];
+  if (!tile || tile.revealed) return;
 
-  if (result.success) {
-    gameState.playerGold = result.newGold;
-    // 金矿立即给予启动资金
-    if (result.tileType === 'mine') {
-      gameState.playerGold += 50;
-    }
-  } else {
-    // 金币不足提示
-    if (result.reason === 'not enough gold') {
+  const revealResult = ResourceSystem.tryReveal(gameState.playerResources);
+  if (!revealResult.success) {
+    if (revealResult.reason === 'not enough gold') {
       showNotification('金币不足！');
+    }
+    return;
+  }
+
+  // 使用 TileReveal 标记已翻开
+  const result = TileReveal.reveal(tileKey, gameState.tiles);
+  if (result.success) {
+    if (result.tileType === 'mine') {
+      ResourceSystem.onMineRevealed(gameState.playerResources);
     }
   }
   updateUI();
@@ -439,12 +474,72 @@ const gameLoop = createGameLoop(() => {
     notificationTimer -= 100;
     if (notificationTimer <= 0) notificationText = '';
   }
+
+  // 1Hz 金矿产出 tick（每 10 个 100ms tick 触发一次）
+  if (tickCount % 10 === 0) {
+    ResourceSystem.tick(gameState.playerResources);
+    ResourceSystem.tick(gameState.aiResources);
+  }
+
   render();
   renderNotification();
   updateUI();
 });
 
 gameLoop.start();
+
+// ============================================================
+// Embedded assertions: ResourceSystem gold management
+// ============================================================
+(function testResourceSystem() {
+  // 测试初始状态
+  const res = ResourceSystem.create(50);
+  console.assert(res.gold === 50, `Initial gold should be 50, got ${res.gold}`);
+  console.assert(res.mineCount === 0, `Initial mine count should be 0, got ${res.mineCount}`);
+
+  // 测试翻牌消耗
+  const revealResult = ResourceSystem.tryReveal(res);
+  console.assert(revealResult.success === true, 'tryReveal with enough gold should succeed');
+  console.assert(res.gold === 40, `Gold should be 40 after reveal, got ${res.gold}`);
+
+  // 测试金币不足
+  const res2 = ResourceSystem.create(5);
+  const failResult = ResourceSystem.tryReveal(res2);
+  console.assert(failResult.success === false, 'tryReveal with insufficient gold should fail');
+  console.assert(failResult.reason === 'not enough gold', 'Fail reason should be "not enough gold"');
+  console.assert(res2.gold === 5, 'Gold should not change on failed reveal');
+
+  // 测试金矿翻出：立即 +50 + 记录矿数
+  const res3 = ResourceSystem.create(50);
+  ResourceSystem.onMineRevealed(res3);
+  console.assert(res3.gold === 100, `Gold after mine should be 100, got ${res3.gold}`);
+  console.assert(res3.mineCount === 1, `Mine count should be 1, got ${res3.mineCount}`);
+
+  // 测试多个金矿叠加
+  ResourceSystem.onMineRevealed(res3);
+  console.assert(res3.gold === 150, `Gold after 2nd mine should be 150, got ${res3.gold}`);
+  console.assert(res3.mineCount === 2, `Mine count should be 2, got ${res3.mineCount}`);
+
+  // 测试 1Hz tick 产出
+  const res4 = ResourceSystem.create(0);
+  ResourceSystem.onMineRevealed(res4); // 1 mine
+  const income1 = ResourceSystem.tick(res4);
+  console.assert(income1 === 5, `Tick income with 1 mine should be 5, got ${income1}`);
+  console.assert(res4.gold === 55, `Gold after tick should be 55 (50+5), got ${res4.gold}`);
+
+  // 测试多金矿叠加产出（直接修改 mineCount 模拟已有 2 矿）
+  res4.mineCount = 2;
+  const income2 = ResourceSystem.tick(res4);
+  console.assert(income2 === 10, `Tick income with 2 mines should be 10, got ${income2}`);
+
+  // 测试无金矿时 tick 不产出
+  const res5 = ResourceSystem.create(100);
+  const income0 = ResourceSystem.tick(res5);
+  console.assert(income0 === 0, `Tick income with 0 mines should be 0, got ${income0}`);
+  console.assert(res5.gold === 100, `Gold should not change with 0 mines, got ${res5.gold}`);
+
+  console.log('[test] ResourceSystem tests passed');
+})();
 
 // ============================================================
 // Embedded assertions for GameLoop behavior

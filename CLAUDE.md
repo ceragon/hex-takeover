@@ -53,3 +53,5 @@ Card collection/upgrades, multi-faction, unit merge/star, real-time PvP, audio/B
 - **GameLoop 断言时机:** `console.assert(tickCount > 0)` 在 loop 启动前同步执行，tickCount 尚未更新。修复：用 `setTimeout(..., 200)` 延迟验证
 - **Playwright file:// 拦截:** Playwright MCP 阻止 `file://` 协议访问。修复：用 `python3 -m http.server` 提供 HTTP 服务
 - **初始化顺序冲突:** `initGameState()` 在 `TileReveal` 定义之前调用，导致 `Cannot access before initialization`。修复：将依赖模块（HexGrid、TileReveal）放在 GameState 初始化之前
+- **新模块初始化顺序:** 新增模块（如 ResourceSystem）必须在 `initGameState()` 之前定义，否则同样触发 `Cannot access before initialization`。修复：新模块紧跟 TileReveal 之后、initGameState 之前
+- **tick 干扰手动测试:** 1Hz 金矿产出 tick 会在测试金币不足时持续加金，导致预期外的翻牌成功。修复：测试金币不足时需同时设置 `mineCount=0` 关闭产出
