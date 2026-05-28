@@ -15,6 +15,7 @@
     font-family: monospace;
     color: #eee;
     min-height: 100vh;
+    position: relative;
   }
   #game-canvas {
     border: 2px solid #0f3460;
@@ -28,6 +29,7 @@
 
 <canvas id="game-canvas" width="560" height="540"></canvas>
 <div id="ui-bar" style="margin-top:8px;font-size:14px;display:flex;gap:32px;">
+  <span id="countdown" style="color:#f44;font-weight:bold;">3:00</span>
   <span id="player-gold" style="color:#6af;">己方金币: 60</span>
   <span id="ai-gold" style="color:#f66;">敌方金币: 60</span>
   <span id="territory-count" style="color:#aaa;">占领: 0/108</span>
@@ -378,6 +380,20 @@ const ResourceSystem = {
     this.gold[player] += amount
   },
 
+  sumMineIncome(tiles, owner) {
+    let income = 0
+    for (const hexId of Object.keys(tiles)) {
+      const tile = tiles[hexId]
+      if (!tile) continue
+      if (tile.owner === owner && tile.state === 'opened'
+          && tile.building && tile.building.type === 'gold_mine'
+          && !tile.ruin) {
+        income += UpgradeSystem.getIncome(tile)
+      }
+    }
+    return income
+  },
+
   countMines(tiles, owner) {
     let count = 0
     for (const hexId of Object.keys(tiles)) {
@@ -397,7 +413,7 @@ const ResourceSystem = {
       this.incomeTick = 0
       for (const side of ['player', 'ai']) {
         this.gold[side] += 12
-        this.gold[side] += this.countMines(tiles, side) * 10
+        this.gold[side] += Math.floor(this.sumMineIncome(tiles, side))
       }
     }
   }
@@ -583,6 +599,190 @@ const RuinSystem = {
 }
 
 // ============================================================
+// UpgradeSystem: 金矿 / 箭塔三档升级（兵营不可升级）
+// 金矿 40/80/160 · 50 金箭塔 30/60/120 · 100 金箭塔 50/100/200
+// 金矿每档 income×1.5 / HP×1.3；箭塔每档 ATK×1.4 / 射程+0.5 / HP×1.2
+// ============================================================
+const UpgradeSystem = {
+  UPGRADE_TABLE: {
+    gold_mine: [
+      { cost: 40,  hpMult: 1.3, incomeMult: 1.5 },
+      { cost: 80,  hpMult: 1.3, incomeMult: 1.5 },
+      { cost: 160, hpMult: 1.3, incomeMult: 1.5 }
+    ],
+    archer_tower_50: [
+      { cost: 30,  hpMult: 1.2, atkMult: 1.4, rangeAdd: 0.5 },
+      { cost: 60,  hpMult: 1.2, atkMult: 1.4, rangeAdd: 0.5 },
+      { cost: 120, hpMult: 1.2, atkMult: 1.4, rangeAdd: 0.5 }
+    ],
+    archer_tower_100: [
+      { cost: 50,  hpMult: 1.2, atkMult: 1.4, rangeAdd: 0.5 },
+      { cost: 100, hpMult: 1.2, atkMult: 1.4, rangeAdd: 0.5 },
+      { cost: 200, hpMult: 1.2, atkMult: 1.4, rangeAdd: 0.5 }
+    ]
+  },
+
+  _key(tile) {
+    if (!tile || !tile.building) return null
+    const t = tile.building.type
+    if (t === 'gold_mine') return 'gold_mine'
+    if (t === 'archer_tower') return `archer_tower_${tile.building.priceTier || 50}`
+    return null
+  },
+
+  canUpgrade(tile) {
+    const key = this._key(tile)
+    if (!key) return false
+    const level = (tile.building && tile.building.level) || 0
+    return level < this.UPGRADE_TABLE[key].length
+  },
+
+  getCost(tile) {
+    const key = this._key(tile)
+    if (!key) return null
+    const level = (tile.building && tile.building.level) || 0
+    const entry = this.UPGRADE_TABLE[key][level]
+    return entry ? entry.cost : null
+  },
+
+  upgrade(tile, player) {
+    if (!this.canUpgrade(tile)) return { ok: false, reason: 'cannot_upgrade' }
+    const key = this._key(tile)
+    const level = tile.building.level || 0
+    const entry = this.UPGRADE_TABLE[key][level]
+    if (!ResourceSystem.trySpend(player, entry.cost)) {
+      return { ok: false, reason: 'insufficient_gold' }
+    }
+    tile.building.level = level + 1
+    if (entry.hpMult) {
+      tile.building.maxHp = Math.round(tile.building.maxHp * entry.hpMult)
+      tile.building.hp = tile.building.maxHp
+    }
+    if (entry.atkMult) {
+      tile.building.atk = Math.round((tile.building.atk || 0) * entry.atkMult)
+    }
+    if (entry.rangeAdd) {
+      tile.building.range = (tile.building.range || 0) + entry.rangeAdd
+    }
+    return { ok: true, newLevel: tile.building.level }
+  },
+
+  getIncome(tile) {
+    if (!tile || !tile.building || tile.building.type !== 'gold_mine') return 0
+    const level = tile.building.level || 0
+    return 10 * Math.pow(1.5, level)
+  }
+}
+
+// ============================================================
+// VictorySystem: 3:00 倒计时 + HQ 血量追踪 + 摧毁直胜波浪 + 时间比格数
+// 两种胜利条件互斥：任一触发即结束，不叠加
+// ============================================================
+const VictorySystem = {
+  INITIAL_COUNTDOWN: 180,
+  INITIAL_HQ_HP: 1000,
+  WAVE_TICKS: 5,
+  WAVE_RADIUS_STEP: 3.0,
+
+  countdown: 180,
+  hqHp: { player: 1000, ai: 1000 },
+  gameOver: null,
+  wave: null,
+
+  init() {
+    this.countdown = this.INITIAL_COUNTDOWN
+    this.hqHp = { player: this.INITIAL_HQ_HP, ai: this.INITIAL_HQ_HP }
+    this.gameOver = null
+    this.wave = null
+  },
+
+  isGameOver() {
+    return this.gameOver !== null
+  },
+
+  _checkHqDestroyed(tiles) {
+    for (const side of ['player', 'ai']) {
+      if (this.hqHp[side] <= 0 && !(this.gameOver || this.wave)) {
+        const winner = side === 'player' ? 'ai' : 'player'
+        const hqHexId = side === 'player'
+          ? `${PLAYER_HQ.q},${PLAYER_HQ.r}`
+          : `${AI_HQ.q},${AI_HQ.r}`
+        this.startWave(winner, hqHexId, tiles)
+        return
+      }
+    }
+  },
+
+  startWave(winner, loserHqHexId, tiles) {
+    if (this.wave || this.gameOver) return
+    const [q, r] = loserHqHexId.split(',').map(Number)
+    this.wave = {
+      winner,
+      loserHqHexId,
+      hex: { q, r },
+      progressTick: 0,
+      radius: 0,
+      progress: 0
+    }
+    this.gameOver = { winner, reason: 'hq_destroyed' }
+  },
+
+  damageHq(side, amount, tiles) {
+    if (this.gameOver) return
+    this.hqHp[side] = Math.max(0, this.hqHp[side] - amount)
+    this._checkHqDestroyed(tiles)
+  },
+
+  _onCountdownExpired(tiles) {
+    if (this.gameOver) return
+    const playerCount = TerritorySystem.count('player')
+    const aiCount = TerritorySystem.count('ai')
+    const winner = playerCount >= aiCount ? 'player' : 'ai'
+    this.gameOver = { winner, reason: 'countdown' }
+  },
+
+  _waveStep(tiles) {
+    if (!this.wave) return
+    this.wave.progressTick++
+    this.wave.progress = this.wave.progressTick / this.WAVE_TICKS
+    this.wave.radius = this.WAVE_RADIUS_STEP * this.wave.progressTick
+    if (this.wave.progressTick >= this.WAVE_TICKS) {
+      this._flipAllTerritory(this.wave.winner, tiles)
+      this.wave = null
+    }
+  },
+
+  _flipAllTerritory(winner, tiles) {
+    const loser = winner === 'player' ? 'ai' : 'player'
+    for (const hexId of Object.keys(TerritorySystem.owners)) {
+      if (TerritorySystem.owners[hexId] === loser) {
+        TerritorySystem.owners[hexId] = winner
+        const tile = tiles[hexId]
+        if (tile) tile.owner = winner
+      }
+    }
+  },
+
+  tick(tiles) {
+    if (this.wave) {
+      this._waveStep(tiles)
+      return
+    }
+    if (this.gameOver) return
+    this.countdown = Math.max(0, this.countdown - 0.1)
+    this._checkHqDestroyed(tiles)
+    if (this.gameOver) return
+    if (this.countdown <= 0.001) {
+      this._onCountdownExpired(tiles)
+    }
+  },
+
+  reset() {
+    this.init()
+  }
+}
+
+// ============================================================
 // CombatSystem: 单位交战 + 建筑受击 + 品阶压制 + 远近切换 + AOE + 箭塔/HQ 自动攻击
 // 攻击频率 1 次/秒（每 10 个 tick 触发一次攻击判定）
 // 品阶压制：damage = atk * 1.5^(attackerTierRank - defenderTierRank)
@@ -724,13 +924,15 @@ const CombatSystem = {
     }
   },
 
-  // 箭塔 / HQ 自动攻击射程内最近的敌方单位
+  // 箭塔 / HQ 自动攻击射程内最近的敌方单位（使用 tile.building 属性，支持升级后的 atk/range）
   attackBuilding(hexId, tile, allUnits, tiles) {
     if (!tile || !tile.building) return
     if (tile.building.type !== 'archer_tower' && tile.building.type !== 'hq') return
-    const spec = BuildingTypes.getSpec(tile.building.type, tile.building.priceTier)
-    if (!spec || spec.atk <= 0) return
-    if ((tile.building.attackCd || 0) > 0) return
+    const b = tile.building
+    const atk = b.atk !== undefined ? b.atk : (BuildingTypes.getSpec(b.type, b.priceTier) || {}).atk || 0
+    const range = b.range !== undefined ? b.range : (BuildingTypes.getSpec(b.type, b.priceTier) || {}).range || 0
+    if (atk <= 0) return
+    if ((b.attackCd || 0) > 0) return
 
     let best = null
     let bestDist = Infinity
@@ -738,14 +940,14 @@ const CombatSystem = {
       if (u.owner === tile.owner) continue
       if (u.hp <= 0) continue
       const d = this._hexDist(hexId, u.hexId)
-      if (d <= spec.range + 0.01 && d < bestDist) {
+      if (d <= range + 0.01 && d < bestDist) {
         bestDist = d
         best = u
       }
     }
     if (best) {
-      best.hp -= spec.atk
-      tile.building.attackCd = this.ATTACK_CD
+      best.hp -= atk
+      b.attackCd = this.ATTACK_CD
       tile.lastAttacker = tile.owner
     }
   },
@@ -764,9 +966,14 @@ const CombatSystem = {
       if (tile.building.hp > 0) continue
       const attacker = tile.lastAttacker
       const prevOwner = tile.owner
+      const isHq = tile.building.type === 'hq'
       this._destroyBuilding(hexId, tile, tiles)
       if (attacker && attacker !== prevOwner) {
-        TerritorySystem.claim(hexId, attacker, tiles, SeededRNG)
+        if (isHq && typeof VictorySystem !== 'undefined') {
+          VictorySystem.startWave(attacker, hexId, tiles)
+        } else {
+          TerritorySystem.claim(hexId, attacker, tiles, SeededRNG)
+        }
       }
     }
   },
@@ -774,6 +981,10 @@ const CombatSystem = {
   _destroyBuilding(hexId, tile, tiles) {
     if (tile.building && tile.building.type === 'barracks') {
       BarracksSystem.destroyBarracks(hexId)
+    }
+    if (tile.building && tile.building.type === 'hq') {
+      tile.building = null
+      return
     }
     RuinSystem.createRuin(hexId, tiles)
   },
@@ -1060,10 +1271,13 @@ const ClickHandler = {
       BarracksSystem.registerBarracks(`${tile.q},${tile.r}`)
     } else if (result.type === 'archer_tower') {
       const spec = BuildingTypes.getSpec('archer_tower', result.priceTier)
-      tile.building = { type: 'archer_tower', priceTier: result.priceTier, hp: spec.hp, maxHp: spec.hp }
+      tile.building = {
+        type: 'archer_tower', priceTier: result.priceTier,
+        hp: spec.hp, maxHp: spec.hp, atk: spec.atk, range: spec.range
+      }
     } else if (result.type === 'gold_mine') {
       const spec = BuildingTypes.getSpec('gold_mine')
-      tile.building = { type: 'gold_mine', hp: spec.hp, maxHp: spec.hp }
+      tile.building = { type: 'gold_mine', hp: spec.hp, maxHp: spec.hp, level: 0 }
     }
 
     TileSystem.activateOpenableTiles(tiles, SeededRNG)
@@ -1104,11 +1318,17 @@ function initGameState() {
   TerritorySystem.init()
   RuinSystem.init()
   CombatSystem.init()
+  VictorySystem.init()
 
   for (const hexId of Object.keys(tiles)) {
     const tile = tiles[hexId]
     if (tile && tile.building && tile.building.type === 'barracks') {
       BarracksSystem.registerBarracks(hexId)
+    }
+    if (tile && tile.building && (tile.building.type === 'archer_tower' || tile.building.type === 'hq')) {
+      const spec = BuildingTypes.getSpec(tile.building.type, tile.building.priceTier)
+      if (spec && tile.building.atk === undefined) tile.building.atk = spec.atk
+      if (spec && tile.building.range === undefined) tile.building.range = spec.range
     }
   }
 
@@ -1229,8 +1449,20 @@ function renderGrid() {
       if (label) drawHexLabel(cx, cy - (subLabel ? 4 : 0), label, labelSize, '#fff')
       if (subLabel) drawHexLabel(cx, cy + 8, subLabel, 8, '#ffcc44')
 
-      // 建筑 HP 条（废墟不显示）
-      if (tile.building && tile.building.hp !== undefined && tile.building.maxHp) {
+      // HQ 专属：大号 HP 条显示在格子上方
+      if (tile.building && tile.building.type === 'hq') {
+        const hpRatio = Math.max(0, (VictorySystem.hqHp[tile.owner] || 0) / VictorySystem.INITIAL_HQ_HP)
+        const barW = size * 1.6
+        const barH = 5
+        const bx = cx - barW / 2
+        const by = cy - size * 0.95
+        ctx.fillStyle = '#111'
+        ctx.fillRect(bx, by, barW, barH)
+        ctx.fillStyle = tile.owner === 'player' ? '#6af' : '#f66'
+        ctx.fillRect(bx, by, barW * hpRatio, barH)
+        drawHexLabel(cx, by - 5, `${Math.ceil(VictorySystem.hqHp[tile.owner] || 0)}`, 8, '#fff')
+      } else if (tile.building && tile.building.hp !== undefined && tile.building.maxHp) {
+        // 普通建筑 HP 条
         const hpRatio = Math.max(0, tile.building.hp / tile.building.maxHp)
         const barW = size * 1.2
         const barH = 3
@@ -1240,6 +1472,12 @@ function renderGrid() {
         ctx.fillRect(bx, by, barW, barH)
         ctx.fillStyle = hpRatio > 0.6 ? '#3c6' : (hpRatio > 0.3 ? '#ec3' : '#e44')
         ctx.fillRect(bx, by, barW * hpRatio, barH)
+      }
+
+      // 升级等级指示（金矿 / 箭塔 Lv.1/2/3）
+      if (tile.building && (tile.building.type === 'gold_mine' || tile.building.type === 'archer_tower')
+          && (tile.building.level || 0) > 0) {
+        drawHexLabel(cx + size * 0.55, cy - size * 0.55, `L${tile.building.level}`, 7, '#ffcc44')
       }
     }
   }
@@ -1293,29 +1531,188 @@ function updateUI() {
   const pg = document.getElementById('player-gold')
   const ag = document.getElementById('ai-gold')
   const tc = document.getElementById('territory-count')
+  const cd = document.getElementById('countdown')
   if (pg) pg.textContent = `己方金币: ${ResourceSystem.gold.player}`
   if (ag) ag.textContent = `敌方金币: ${ResourceSystem.gold.ai}`
   if (tc) tc.textContent = `占领: ${TerritorySystem.count('player')}/${TerritorySystem.total}`
+  if (cd) {
+    const sec = Math.ceil(VictorySystem.countdown)
+    const m = Math.floor(sec / 60)
+    const s = sec % 60
+    cd.textContent = `${m}:${String(s).padStart(2, '0')}`
+    cd.style.color = sec < 30 ? '#f22' : '#f44'
+  }
+}
+
+function renderWave() {
+  const wave = VictorySystem.wave
+  if (!wave) return
+  const hex = wave.hex
+  const px = HexGrid.axialToPixel(hex.q, hex.r)
+  const cx = px.x + RENDER_OFFSET.x
+  const cy = px.y + RENDER_OFFSET.y
+  const maxRadius = VictorySystem.WAVE_RADIUS_STEP * VictorySystem.WAVE_TICKS * HexGrid.hexSize
+  const radius = wave.progress * maxRadius
+  const color = wave.winner === 'player' ? '100, 170, 255' : '255, 100, 100'
+  ctx.save()
+  ctx.beginPath()
+  ctx.arc(cx, cy, radius, 0, Math.PI * 2)
+  ctx.fillStyle = `rgba(${color}, ${0.25 * (1 - wave.progress * 0.5)})`
+  ctx.fill()
+  ctx.strokeStyle = `rgba(${color}, 0.9)`
+  ctx.lineWidth = 3
+  ctx.stroke()
+  ctx.restore()
 }
 
 function render() {
   renderGrid()
   renderUnits()
+  renderWave()
   updateUI()
+  renderGameOverOverlay()
+}
+
+function renderGameOverOverlay() {
+  let overlay = document.getElementById('game-over-overlay')
+  if (!VictorySystem.isGameOver() || VictorySystem.wave !== null) {
+    if (overlay) overlay.style.display = 'none'
+    return
+  }
+  if (!overlay) {
+    overlay = document.createElement('div')
+    overlay.id = 'game-over-overlay'
+    overlay.style.cssText = `position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.75);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:100;`
+    overlay.innerHTML = `
+      <h1 id="game-over-title" style="font-size:48px;margin-bottom:16px;"></h1>
+      <p id="game-over-reason" style="font-size:18px;color:#aaa;margin-bottom:32px;"></p>
+      <button id="restart-btn" style="padding:12px 32px;font-size:18px;background:#48f;color:#fff;border:none;border-radius:6px;cursor:pointer;font-family:monospace;">重新开始</button>
+    `
+    document.body.appendChild(overlay)
+    document.getElementById('restart-btn').addEventListener('click', (e) => {
+      e.stopPropagation()
+      restartGame()
+    })
+  }
+  const go = VictorySystem.gameOver
+  const title = document.getElementById('game-over-title')
+  const reason = document.getElementById('game-over-reason')
+  if (title) {
+    title.textContent = go.winner === 'player' ? '胜利' : '失败'
+    title.style.color = go.winner === 'player' ? '#6f6' : '#f66'
+  }
+  if (reason) {
+    if (go.reason === 'hq_destroyed') {
+      reason.textContent = go.winner === 'player' ? '敌方 HQ 已被摧毁' : '己方 HQ 已被摧毁'
+    } else {
+      const p = TerritorySystem.count('player')
+      const a = TerritorySystem.count('ai')
+      reason.textContent = `时间耗尽 · 玩家 ${p} 格 vs AI ${a} 格`
+    }
+  }
+  overlay.style.display = 'flex'
+}
+
+function showUpgradePanel(tile) {
+  hideUpgradePanel()
+  const panel = document.createElement('div')
+  panel.id = 'upgrade-panel'
+  const cost = UpgradeSystem.getCost(tile)
+  const level = tile.building.level || 0
+  const gold = ResourceSystem.gold.player
+  const nameMap = { gold_mine: '金矿', archer_tower: '箭塔' }
+  const name = nameMap[tile.building.type] || tile.building.type
+  let preview = ''
+  if (tile.building.type === 'gold_mine') {
+    const cur = Math.round(UpgradeSystem.getIncome(tile))
+    const tile2 = { building: { ...tile.building, level: level + 1 } }
+    const next = Math.round(UpgradeSystem.getIncome(tile2))
+    preview = `产金 ${cur} → ${next} / 6s`
+  } else if (tile.building.type === 'archer_tower') {
+    const curAtk = tile.building.atk
+    const curRange = tile.building.range
+    const nextAtk = Math.round(curAtk * 1.4)
+    const nextRange = (curRange + 0.5).toFixed(1)
+    preview = `ATK ${curAtk} → ${nextAtk} · 射程 ${curRange.toFixed(1)} → ${nextRange}`
+  }
+  panel.innerHTML = `
+    <div style="background:#222;padding:12px 16px;border:2px solid #48f;border-radius:6px;min-width:220px;">
+      <div style="font-size:16px;margin-bottom:8px;">${name} · Lv.${level}</div>
+      <div style="font-size:12px;color:#aaa;margin-bottom:8px;">${preview}</div>
+      <button id="upgrade-btn" style="width:100%;padding:8px;font-size:14px;background:${gold >= cost ? '#48f' : '#555'};color:#fff;border:none;border-radius:4px;cursor:${gold >= cost ? 'pointer' : 'not-allowed'};font-family:monospace;">升级 (${cost} 金)</button>
+      <button id="upgrade-close" style="width:100%;padding:4px;font-size:12px;background:transparent;color:#888;border:1px solid #444;border-radius:4px;cursor:pointer;margin-top:6px;font-family:monospace;">关闭</button>
+    </div>
+  `
+  panel.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:50;'
+  document.body.appendChild(panel)
+  const btn = document.getElementById('upgrade-btn')
+  if (gold >= cost) {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation()
+      const result = UpgradeSystem.upgrade(tile, 'player')
+      if (result.ok) {
+        showNotification(`升级成功 → Lv.${result.newLevel}`)
+      } else if (result.reason === 'insufficient_gold') {
+        showNotification('金币不足')
+      }
+      hideUpgradePanel()
+      render()
+    })
+  }
+  document.getElementById('upgrade-close').addEventListener('click', (e) => {
+    e.stopPropagation()
+    hideUpgradePanel()
+  })
+}
+
+function hideUpgradePanel() {
+  const p = document.getElementById('upgrade-panel')
+  if (p) p.remove()
+}
+
+function restartGame() {
+  VictorySystem.reset()
+  gameState = initGameState()
+  tickCount = 0
+  hideUpgradePanel()
+  const overlay = document.getElementById('game-over-overlay')
+  if (overlay) overlay.remove()
+  render()
 }
 
 // ============================================================
 // Click handling
 // ============================================================
 canvas.addEventListener('click', (event) => {
+  if (VictorySystem.isGameOver()) return
   const rect = canvas.getBoundingClientRect()
   const mx = event.clientX - rect.left - RENDER_OFFSET.x
   const my = event.clientY - rect.top - RENDER_OFFSET.y
 
   const hex = HexGrid.findHexAt(mx, my)
-  if (!hex) return
+  if (!hex) {
+    hideUpgradePanel()
+    return
+  }
   const tile = gameState.tiles[`${hex.q},${hex.r}`]
-  if (!tile) return
+  if (!tile) {
+    hideUpgradePanel()
+    return
+  }
+
+  // 点击己方金矿/箭塔 → 弹出升级面板（未满级时）
+  if (tile.state === 'opened' && tile.owner === 'player' && tile.building
+      && (tile.building.type === 'gold_mine' || tile.building.type === 'archer_tower')) {
+    if (UpgradeSystem.canUpgrade(tile)) {
+      showUpgradePanel(tile)
+    } else {
+      hideUpgradePanel()
+      showNotification('已满级')
+    }
+    return
+  }
+
+  hideUpgradePanel()
   const result = ClickHandler.handleTileClick(tile, gameState.tiles, 'player')
   if (result.ok) {
     render()
@@ -1327,10 +1724,13 @@ canvas.addEventListener('click', (event) => {
 // ============================================================
 const gameLoop = createGameLoop(() => {
   tickCount++
-  ResourceSystem.tick(gameState.tiles)
-  BarracksSystem.tick(gameState.tiles, SeededRNG)
-  MoveUnits.tick(BarracksSystem.units, gameState.tiles)
-  CombatSystem.tick(BarracksSystem.units, gameState.tiles)
+  VictorySystem.tick(gameState.tiles)
+  if (!VictorySystem.isGameOver()) {
+    ResourceSystem.tick(gameState.tiles)
+    BarracksSystem.tick(gameState.tiles, SeededRNG)
+    MoveUnits.tick(BarracksSystem.units, gameState.tiles)
+    CombatSystem.tick(BarracksSystem.units, gameState.tiles)
+  }
   render()
 })
 
@@ -2711,6 +3111,247 @@ gameLoop.start()
     'RuinSystem.init should clear ruins')
 
   console.log('[test] RuinSystem tests passed')
+})()
+
+// ============================================================
+// UpgradeSystem tests: 三档成本表 + 属性提升 + 满级不可升级 + 兵营不可升级
+// ============================================================
+;(function testUpgradeSystem() {
+  ResourceSystem.init()
+
+  // === 1. 金矿三档成本 ===
+  const gm = { owner: 'player', state: 'opened',
+    building: { type: 'gold_mine', hp: 150, maxHp: 150, level: 0 } }
+  console.assert(UpgradeSystem.getCost(gm) === 40, `gold mine L0 cost should be 40, got ${UpgradeSystem.getCost(gm)}`)
+  gm.building.level = 1
+  console.assert(UpgradeSystem.getCost(gm) === 80, `gold mine L1 cost should be 80, got ${UpgradeSystem.getCost(gm)}`)
+  gm.building.level = 2
+  console.assert(UpgradeSystem.getCost(gm) === 160, `gold mine L2 cost should be 160, got ${UpgradeSystem.getCost(gm)}`)
+  gm.building.level = 3
+  console.assert(UpgradeSystem.getCost(gm) === null, 'gold mine L3 cost should be null')
+
+  // === 2. 50 金箭塔三档成本 ===
+  const at50 = { owner: 'player', state: 'opened',
+    building: { type: 'archer_tower', priceTier: 50, hp: 250, maxHp: 250, atk: 35, range: 3.5, level: 0 } }
+  console.assert(UpgradeSystem.getCost(at50) === 30, `tower 50 L0 cost 30, got ${UpgradeSystem.getCost(at50)}`)
+  at50.building.level = 1
+  console.assert(UpgradeSystem.getCost(at50) === 60, `tower 50 L1 cost 60, got ${UpgradeSystem.getCost(at50)}`)
+  at50.building.level = 2
+  console.assert(UpgradeSystem.getCost(at50) === 120, `tower 50 L2 cost 120, got ${UpgradeSystem.getCost(at50)}`)
+  at50.building.level = 3
+  console.assert(UpgradeSystem.getCost(at50) === null, 'tower 50 L3 cost null')
+
+  // === 3. 100 金箭塔三档成本 ===
+  const at100 = { owner: 'player', state: 'opened',
+    building: { type: 'archer_tower', priceTier: 100, hp: 350, maxHp: 350, atk: 50, range: 5.0, level: 0 } }
+  console.assert(UpgradeSystem.getCost(at100) === 50, `tower 100 L0 cost 50, got ${UpgradeSystem.getCost(at100)}`)
+  at100.building.level = 2
+  console.assert(UpgradeSystem.getCost(at100) === 200, `tower 100 L2 cost 200, got ${UpgradeSystem.getCost(at100)}`)
+
+  // === 4. canUpgrade：兵营不可升级 ===
+  const bar = { owner: 'player', state: 'opened',
+    building: { type: 'barracks', tier: 'green', hp: 200, maxHp: 200 } }
+  console.assert(UpgradeSystem.canUpgrade(bar) === false, 'barracks cannot upgrade')
+
+  // === 5. canUpgrade：HQ 不可升级 ===
+  const hq = { owner: 'player', state: 'opened',
+    building: { type: 'hq', hp: 1000, maxHp: 1000 } }
+  console.assert(UpgradeSystem.canUpgrade(hq) === false, 'hq cannot upgrade')
+
+  // === 6. canUpgrade：满级金矿返回 false ===
+  const gmMax = { owner: 'player', state: 'opened',
+    building: { type: 'gold_mine', hp: 150, maxHp: 150, level: 3 } }
+  console.assert(UpgradeSystem.canUpgrade(gmMax) === false, 'max-level gold mine cannot upgrade')
+  console.assert(UpgradeSystem.getCost(gmMax) === null, 'max-level cost null')
+
+  // === 7. 金矿升级：HP×1.3、maxHp×1.3、level+1 ===
+  ResourceSystem.init()
+  ResourceSystem.gold.player = 200
+  const gmUp = { owner: 'player', state: 'opened',
+    building: { type: 'gold_mine', hp: 150, maxHp: 150, level: 0 } }
+  const r7 = UpgradeSystem.upgrade(gmUp, 'player')
+  console.assert(r7.ok === true && r7.newLevel === 1, `gold mine upgrade L0→L1, got ${JSON.stringify(r7)}`)
+  console.assert(gmUp.building.maxHp === 195, `gold mine L1 maxHp=195, got ${gmUp.building.maxHp}`)
+  console.assert(gmUp.building.hp === 195, `gold mine L1 hp=195 (full heal), got ${gmUp.building.hp}`)
+  console.assert(ResourceSystem.gold.player === 160, `gold deducted: 200-40=160, got ${ResourceSystem.gold.player}`)
+
+  // === 8. 升级立即生效：下一 tick 产金增加 (level 1 → 15g) ===
+  console.assert(Math.round(UpgradeSystem.getIncome(gmUp)) === 15,
+    `gold mine L1 income=15, got ${UpgradeSystem.getIncome(gmUp)}`)
+  gmUp.building.level = 2
+  console.assert(Math.round(UpgradeSystem.getIncome(gmUp)) === 23,
+    `gold mine L2 income=23 (22.5 rounded), got ${Math.round(UpgradeSystem.getIncome(gmUp))}`)
+
+  // === 9. 箭塔升级：ATK×1.4 / 射程+0.5 ===
+  ResourceSystem.init()
+  ResourceSystem.gold.player = 200
+  const atUp = { owner: 'player', state: 'opened',
+    building: { type: 'archer_tower', priceTier: 50, hp: 250, maxHp: 250, atk: 35, range: 3.5, level: 0 } }
+  const r9 = UpgradeSystem.upgrade(atUp, 'player')
+  console.assert(r9.ok && r9.newLevel === 1, 'tower 50 upgrade L0→L1')
+  console.assert(atUp.building.atk === 49, `tower L1 atk=49 (35×1.4), got ${atUp.building.atk}`)
+  console.assert(Math.abs(atUp.building.range - 4.0) < 0.01,
+    `tower L1 range=4.0, got ${atUp.building.range}`)
+  console.assert(atUp.building.maxHp === 300, `tower L1 maxHp=300 (250×1.2), got ${atUp.building.maxHp}`)
+
+  // === 10. 满级后 upgrade 返回 cannot_upgrade ===
+  const gmFull = { owner: 'player', state: 'opened',
+    building: { type: 'gold_mine', hp: 300, maxHp: 300, level: 3 } }
+  ResourceSystem.gold.player = 500
+  const r10 = UpgradeSystem.upgrade(gmFull, 'player')
+  console.assert(r10.ok === false && r10.reason === 'cannot_upgrade',
+    'max-level upgrade returns cannot_upgrade')
+  console.assert(ResourceSystem.gold.player === 500, 'gold not deducted on max-level attempt')
+
+  // === 11. 金币不足时 upgrade 失败 ===
+  ResourceSystem.init()
+  ResourceSystem.gold.player = 10
+  const gmPoor = { owner: 'player', state: 'opened',
+    building: { type: 'gold_mine', hp: 150, maxHp: 150, level: 0 } }
+  const r11 = UpgradeSystem.upgrade(gmPoor, 'player')
+  console.assert(r11.ok === false && r11.reason === 'insufficient_gold',
+    'insufficient gold returns insufficient_gold')
+  console.assert(gmPoor.building.level === 0, 'level unchanged on fail')
+
+  console.log('[test] UpgradeSystem tests passed')
+})()
+
+// ============================================================
+// VictorySystem tests: 倒计时 + HQ 摧毁 + 波浪 + 比格数 + 互斥 + reset
+// ============================================================
+;(function testVictorySystem() {
+  function freshTiles() {
+    const tiles = {}
+    for (let r = 0; r < HexGrid.ROWS; r++) {
+      for (let q = 0; q < HexGrid.COLS; q++) {
+        tiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+      }
+    }
+    return tiles
+  }
+
+  // === 1. init 状态 ===
+  VictorySystem.init()
+  console.assert(VictorySystem.countdown === 180, `init countdown=180, got ${VictorySystem.countdown}`)
+  console.assert(VictorySystem.hqHp.player === 1000 && VictorySystem.hqHp.ai === 1000,
+    'init HQ HP 1000/1000')
+  console.assert(VictorySystem.isGameOver() === false, 'init not game over')
+  console.assert(VictorySystem.wave === null, 'init wave null')
+
+  // === 2. 每 tick 减 0.1 秒 ===
+  VictorySystem.init()
+  const t2 = freshTiles()
+  for (let i = 0; i < 10; i++) VictorySystem.tick(t2)
+  console.assert(Math.abs(VictorySystem.countdown - 179) < 0.01,
+    `10 ticks = -1.0s, countdown=${VictorySystem.countdown}`)
+
+  // === 3. 未到 0 不触发 game over ===
+  VictorySystem.init()
+  const t3 = freshTiles()
+  for (let i = 0; i < 1799; i++) VictorySystem.tick(t3)
+  console.assert(VictorySystem.countdown > 0 && VictorySystem.countdown < 0.2,
+    `1799 ticks: countdown=${VictorySystem.countdown}`)
+  console.assert(VictorySystem.isGameOver() === false,
+    'countdown > 0 not game over yet')
+
+  // === 4. 倒计时归零 → 玩家格多 → 玩家胜 ===
+  VictorySystem.init()
+  const t4 = freshTiles()
+  TerritorySystem.init()
+  TerritorySystem.claim('4,10', 'player', t4, SeededRNG)
+  TerritorySystem.claim('4,9', 'player', t4, SeededRNG)
+  TerritorySystem.claim('4,2', 'ai', t4, SeededRNG)
+  for (let i = 0; i < 1800; i++) VictorySystem.tick(t4)
+  console.assert(VictorySystem.isGameOver() === true, 'countdown=0 triggers game over')
+  console.assert(VictorySystem.gameOver.reason === 'countdown',
+    `reason= countdown, got ${VictorySystem.gameOver.reason}`)
+  console.assert(VictorySystem.gameOver.winner === 'player',
+    `player wins with more territory, got ${VictorySystem.gameOver.winner}`)
+
+  // === 5. 倒计时归零 → AI 格多 → AI 胜 ===
+  VictorySystem.init()
+  const t5 = freshTiles()
+  TerritorySystem.init()
+  TerritorySystem.claim('4,10', 'player', t5, SeededRNG)
+  TerritorySystem.claim('4,2', 'ai', t5, SeededRNG)
+  TerritorySystem.claim('4,3', 'ai', t5, SeededRNG)
+  for (let i = 0; i < 1800; i++) VictorySystem.tick(t5)
+  console.assert(VictorySystem.gameOver.winner === 'ai',
+    `ai wins with more territory, got ${VictorySystem.gameOver.winner}`)
+
+  // === 6. 平局按玩家胜 ===
+  VictorySystem.init()
+  const t6 = freshTiles()
+  TerritorySystem.init()
+  TerritorySystem.claim('4,10', 'player', t6, SeededRNG)
+  TerritorySystem.claim('4,2', 'ai', t6, SeededRNG)
+  for (let i = 0; i < 1800; i++) VictorySystem.tick(t6)
+  console.assert(VictorySystem.gameOver.winner === 'player',
+    `tie goes to player, got ${VictorySystem.gameOver.winner}`)
+
+  // === 7. HQ HP 归零 → 波浪启动 + gameOver (hq_destroyed) ===
+  VictorySystem.init()
+  const t7 = freshTiles()
+  VictorySystem.damageHq('ai', 1000, t7)
+  console.assert(VictorySystem.hqHp.ai === 0, 'ai HQ HP = 0')
+  console.assert(VictorySystem.isGameOver() === true, 'HQ destroy triggers game over')
+  console.assert(VictorySystem.gameOver.reason === 'hq_destroyed',
+    `reason=hq_destroyed, got ${VictorySystem.gameOver.reason}`)
+  console.assert(VictorySystem.gameOver.winner === 'player',
+    `player wins on ai HQ destroy, got ${VictorySystem.gameOver.winner}`)
+
+  // === 8. 己方 HQ 被摧毁 → AI 胜 ===
+  VictorySystem.init()
+  const t8 = freshTiles()
+  VictorySystem.damageHq('player', 1000, t8)
+  console.assert(VictorySystem.gameOver.winner === 'ai',
+    `ai wins on player HQ destroy, got ${VictorySystem.gameOver.winner}`)
+
+  // === 9. 波浪动画：5 ticks 完成，结束时翻转全部领地 ===
+  VictorySystem.init()
+  const t9 = freshTiles()
+  TerritorySystem.init()
+  TerritorySystem.claim('4,2', 'ai', t9, SeededRNG)
+  TerritorySystem.claim('4,3', 'ai', t9, SeededRNG)
+  TerritorySystem.claim('4,10', 'player', t9, SeededRNG)
+  VictorySystem.startWave('player', `${AI_HQ.q},${AI_HQ.r}`, t9)
+  console.assert(VictorySystem.wave !== null, 'wave started')
+  console.assert(VictorySystem.isGameOver() === true, 'game over set on startWave')
+  for (let i = 0; i < 4; i++) VictorySystem.tick(t9)
+  console.assert(VictorySystem.wave !== null, 'wave still active after 4 ticks')
+  console.assert(VictorySystem.wave.progressTick === 4, `progressTick=4, got ${VictorySystem.wave.progressTick}`)
+  VictorySystem.tick(t9)
+  console.assert(VictorySystem.wave === null, 'wave cleared after 5 ticks')
+  console.assert(TerritorySystem.owners['4,2'] === 'player',
+    'ai territory flipped to player after wave')
+  console.assert(TerritorySystem.owners['4,3'] === 'player',
+    'second ai tile flipped')
+
+  // === 10. 互斥：HQ 摧毁后倒计时不再触发第二 game over ===
+  VictorySystem.init()
+  const t10 = freshTiles()
+  TerritorySystem.init()
+  TerritorySystem.claim('4,2', 'ai', t10, SeededRNG)
+  TerritorySystem.claim('4,3', 'ai', t10, SeededRNG)
+  TerritorySystem.claim('4,10', 'player', t10, SeededRNG)
+  VictorySystem.damageHq('ai', 1000, t10)
+  const originalGameOver = VictorySystem.gameOver
+  for (let i = 0; i < 2000; i++) VictorySystem.tick(t10)
+  console.assert(VictorySystem.gameOver === originalGameOver,
+    'gameOver object unchanged after HQ destroy + countdown elapse')
+  console.assert(VictorySystem.gameOver.reason === 'hq_destroyed',
+    'hq_destroyed reason preserved')
+
+  // === 11. reset 重置所有状态 ===
+  VictorySystem.damageHq('ai', 500, t10)
+  VictorySystem.reset()
+  console.assert(VictorySystem.countdown === 180, 'reset countdown=180')
+  console.assert(VictorySystem.hqHp.player === 1000 && VictorySystem.hqHp.ai === 1000,
+    'reset HQ HP')
+  console.assert(VictorySystem.isGameOver() === false, 'reset clears game over')
+  console.assert(VictorySystem.wave === null, 'reset clears wave')
+
+  console.log('[test] VictorySystem tests passed')
 })()
 
 // 测试会重置全局系统，重新初始化游戏状态
