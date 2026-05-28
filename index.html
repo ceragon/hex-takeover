@@ -232,7 +232,6 @@ const TileSystem = {
     'metal':  [10, 55, 25, 10]
   },
 
-  // 兵营槽 (?)：按档位查兵种品阶概率（含"空"）
   BARRACKS_PROB: {
     25:  { empty: 50, green: 25, blue: 15, purple: 7.5, gold: 2.5 },
     50:  { empty: 0,  green: 50, blue: 30, purple: 15,  gold: 5 },
@@ -240,7 +239,6 @@ const TileSystem = {
     250: { empty: 0,  green: 0,  blue: 0,  purple: 50,  gold: 50 }
   },
 
-  // 头盔：按档位查兵种品阶概率（永不空）
   HELMET_PROB: {
     25:  { green: 50, blue: 35, purple: 12, gold: 3 },
     50:  { green: 20, blue: 50, purple: 22, gold: 8 },
@@ -256,13 +254,6 @@ const TileSystem = {
     return { icon, price }
   },
 
-  // 开地块：按 icon + price 走二次概率表，返回 BuildingResult
-  // 返回值形态：
-  //   { type: 'empty' }                           // 仅 25 金档 ? 可能
-  //   { type: 'barracks', tier: 'green'|'blue'|'purple'|'gold' }
-  //   { type: 'unit_card', tier: 'green'|'blue'|'purple'|'gold' }  // 已确定兵种（头盔产出）
-  //   { type: 'archer_tower', priceTier: 50|100 }
-  //   { type: 'gold_mine' }
   open({ icon, price }, rng) {
     if (icon === '?') {
       const table = this.BARRACKS_PROB[price]
@@ -337,11 +328,19 @@ const OpeningLayout = {
     for (let i = 0; i < slots.length; i++) {
       const { q, r } = slots[i]
       const hexId = `${q},${r}`
+      let building = { type: results[i] }
+      if (results[i] === 'barracks') {
+        const tier = rng.weightedPick(['green', 'blue', 'purple', 'gold'], [50, 30, 15, 5])
+        building = { type: 'barracks', tier }
+      } else if (results[i] === 'archer_tower') {
+        const priceTier = rng.weightedPick([50, 100], [50, 50])
+        building = { type: 'archer_tower', priceTier }
+      }
       tiles[hexId] = {
         q, r,
         owner: hq.owner,
         state: 'opened',
-        building: { type: results[i] }
+        building
       }
     }
 
@@ -376,6 +375,7 @@ const ResourceSystem = {
     let count = 0
     for (const hexId of Object.keys(tiles)) {
       const tile = tiles[hexId]
+      if (!tile) continue
       if (tile.owner === owner && tile.state === 'opened'
           && tile.building && tile.building.type === 'gold_mine') {
         count++
@@ -393,6 +393,98 @@ const ResourceSystem = {
         this.gold[side] += this.countMines(tiles, side) * 10
       }
     }
+  }
+}
+
+// ============================================================
+// UnitTypes: 6 兵种 × 4 品阶的纯数据表（与 BarracksSystem 解耦）
+// ============================================================
+const UnitTypes = {
+  definitions: {
+    skeleton:    { tier: 'green',  name: '骷髅怪', hp: 120, atk: 15, speed: 0.4, range: 1.2, cd: 3,   trait: 'melee_tanky' },
+    wolf:        { tier: 'green',  name: '野狼',   hp: 80,  atk: 25, speed: 0.8, range: 1.2, cd: 3,   trait: 'melee_fast' },
+    warrior:     { tier: 'blue',   name: '人类战士', hp: 180, atk: 25, speed: 0.4, range: [1.5, 3.0], cd: 4.5, trait: 'range_swap' },
+    archer:      { tier: 'blue',   name: '人类弓手', hp: 120, atk: 35, speed: 0.8, range: [1.5, 3.0], cd: 4.5, trait: 'range_swap' },
+    cavalry:     { tier: 'purple', name: '人类骑兵', hp: 200, atk: 40, speed: 1.0, range: 4.0, cd: 6,   trait: 'fly_building' },
+    dragon:      { tier: 'gold',   name: '龙骑兵',  hp: 300, atk: 60, speed: 0.6, range: 5.5, cd: 9,   trait: 'aoe_cd_melee' }
+  },
+
+  tierToUnits: {
+    green:  ['skeleton', 'wolf'],
+    blue:   ['warrior', 'archer'],
+    purple: ['cavalry'],
+    gold:   ['dragon']
+  },
+
+  tierToCd: {
+    green:  3,
+    blue:   4.5,
+    purple: 6,
+    gold:   9
+  },
+
+  get(unitKey) {
+    return this.definitions[unitKey]
+  },
+
+  pickUnitForTier(tier, rng) {
+    const units = this.tierToUnits[tier]
+    if (!units) throw new Error(`UnitTypes: unknown tier "${tier}"`)
+    return rng.weightedPick(units, units.map(() => 1))
+  }
+}
+
+// ============================================================
+// BarracksSystem: 已开兵营/头盔格子按 CD 吐出单位
+// ============================================================
+const BarracksSystem = {
+  timers: {},
+  units: [],
+
+  init() {
+    this.timers = {}
+    this.units = []
+  },
+
+  registerBarracks(hexId) {
+    this.timers[hexId] = 0
+  },
+
+  removeBarracks(hexId) {
+    delete this.timers[hexId]
+  },
+
+  tick(tiles, rng) {
+    const spawned = []
+    for (const hexId of Object.keys(this.timers)) {
+      const tile = tiles[hexId]
+      if (!tile || !tile.building) continue
+      if (tile.building.type !== 'barracks') continue
+
+      const tier = tile.building.tier
+      const cdTicks = UnitTypes.tierToCd[tier] * 10
+
+      this.timers[hexId] = (this.timers[hexId] || 0) + 1
+      if (this.timers[hexId] >= cdTicks) {
+        this.timers[hexId] = 0
+        const unitKey = UnitTypes.pickUnitForTier(tier, rng)
+        const unitDef = UnitTypes.get(unitKey)
+        const unit = {
+          key: unitKey,
+          tier: unitDef.tier,
+          owner: tile.owner,
+          hexId,
+          hp: unitDef.hp,
+          atk: unitDef.atk,
+          speed: unitDef.speed,
+          range: unitDef.range,
+          trait: unitDef.trait
+        }
+        this.units.push(unit)
+        spawned.push(unit)
+      }
+    }
+    return spawned
   }
 }
 
@@ -420,13 +512,11 @@ function showNotification(msg) {
 
 // ============================================================
 // ClickHandler: 开地块核心动作
-// handleTileClick(tile, tiles, player) → { ok, reason?, result? }
 // ============================================================
 const ClickHandler = {
   handleTileClick(tile, tiles, player) {
     if (!tile) return { ok: false, reason: 'no_tile' }
     if (tile.state !== 'openable') return { ok: false, reason: 'not_openable' }
-    // 只能开自己领地相邻激活的格子（owner=null 或 owner=player 都可开，但不能开 AI 的）
     if (tile.owner && tile.owner !== player) return { ok: false, reason: 'not_openable' }
 
     if (!ResourceSystem.trySpend(player, tile.price)) {
@@ -445,16 +535,16 @@ const ClickHandler = {
       tile.building = null
     } else if (result.type === 'barracks') {
       tile.building = { type: 'barracks', tier: result.tier }
+      BarracksSystem.registerBarracks(`${tile.q},${tile.r}`)
     } else if (result.type === 'unit_card') {
-      // 头盔：已确定兵种，行为与 barracks 等价（slice 4 处理吐兵）
       tile.building = { type: 'barracks', tier: result.tier, card: true }
+      BarracksSystem.registerBarracks(`${tile.q},${tile.r}`)
     } else if (result.type === 'archer_tower') {
       tile.building = { type: 'archer_tower', priceTier: result.priceTier }
     } else if (result.type === 'gold_mine') {
       tile.building = { type: 'gold_mine' }
     }
 
-    // 激活连锁：新领地周围的 inactive 格变 openable
     TileSystem.activateOpenableTiles(tiles, SeededRNG)
 
     return { ok: true, result }
@@ -462,7 +552,7 @@ const ClickHandler = {
 }
 
 // ============================================================
-// v2 Slice 2: GameState（格子状态机 + 开局布局 + 经济系统）
+// v2 GameState（格子状态机 + 开局布局 + 经济系统 + 兵营吐兵）
 // ============================================================
 const PLAYER_HQ = { q: 4, r: 11, owner: 'player' }
 const AI_HQ = { q: 4, r: 1, owner: 'ai' }
@@ -486,6 +576,14 @@ function initGameState() {
   OpeningLayout.generateOpening(AI_HQ, tiles, SeededRNG)
 
   ResourceSystem.init()
+  BarracksSystem.init()
+
+  for (const hexId of Object.keys(tiles)) {
+    const tile = tiles[hexId]
+    if (tile && tile.building && tile.building.type === 'barracks') {
+      BarracksSystem.registerBarracks(hexId)
+    }
+  }
 
   TileSystem.activateOpenableTiles(tiles, SeededRNG)
 
@@ -502,6 +600,18 @@ const canvas = document.getElementById('game-canvas')
 const ctx = canvas.getContext('2d')
 
 const RENDER_OFFSET = { x: 75, y: 35 }
+
+const TIER_COLORS = {
+  green:  '#4a8',
+  blue:   '#48f',
+  purple: '#a4f',
+  gold:   '#fc4'
+}
+
+const OWNER_UNIT_COLOR = {
+  player: '#8cf',
+  ai:     '#f66'
+}
 
 function drawHex(cx, cy, size, fillColor, strokeColor = '#333') {
   ctx.beginPath()
@@ -591,6 +701,33 @@ function renderGrid() {
   }
 }
 
+function renderUnits() {
+  const units = BarracksSystem.units
+  for (const unit of units) {
+    const tile = gameState.tiles[unit.hexId]
+    if (!tile) continue
+    const { x, y } = HexGrid.axialToPixel(tile.q, tile.r)
+    const cx = x + RENDER_OFFSET.x
+    const cy = y + RENDER_OFFSET.y
+
+    const sameHexUnits = units.filter(u => u.hexId === unit.hexId && u.owner === unit.owner)
+    const idx = sameHexUnits.indexOf(unit)
+    const offsetAngle = idx * (Math.PI * 2 / Math.max(sameHexUnits.length, 4))
+    const offsetDist = 4
+    const ox = Math.cos(offsetAngle) * offsetDist
+    const oy = Math.sin(offsetAngle) * offsetDist
+
+    const radius = unit.tier === 'gold' ? 5 : (unit.tier === 'purple' ? 4 : 3)
+    ctx.beginPath()
+    ctx.arc(cx + ox, cy + oy - 6, radius, 0, Math.PI * 2)
+    ctx.fillStyle = OWNER_UNIT_COLOR[unit.owner] || '#fff'
+    ctx.fill()
+    ctx.strokeStyle = TIER_COLORS[unit.tier] || '#fff'
+    ctx.lineWidth = 1.5
+    ctx.stroke()
+  }
+}
+
 function updateUI() {
   const pg = document.getElementById('player-gold')
   const ag = document.getElementById('ai-gold')
@@ -600,11 +737,12 @@ function updateUI() {
 
 function render() {
   renderGrid()
+  renderUnits()
   updateUI()
 }
 
 // ============================================================
-// Click handling（slice 2：仅做命中检测 + 格子状态日志）
+// Click handling
 // ============================================================
 canvas.addEventListener('click', (event) => {
   const rect = canvas.getBoundingClientRect()
@@ -627,6 +765,8 @@ canvas.addEventListener('click', (event) => {
 const gameLoop = createGameLoop(() => {
   tickCount++
   ResourceSystem.tick(gameState.tiles)
+  BarracksSystem.tick(gameState.tiles, SeededRNG)
+  render()
 })
 
 render()
@@ -636,7 +776,6 @@ gameLoop.start()
 // Embedded assertions: HexGrid (v2 — 9×12 + 湖水)
 // ============================================================
 ;(function testHexGrid() {
-  // 1. 地图尺寸与湖水
   const coords = HexGrid.generateCoords()
   console.assert(coords.length === 9 * 13, `应生成 117 个格子，实际 ${coords.length}`)
 
@@ -647,7 +786,6 @@ gameLoop.start()
   console.assert(HexGrid.isLake(4, 12) === false, 'HQ 所在行不是湖水')
   console.assert(HexGrid.isLake(0, 7) === false, '(0,7) 不是湖水')
 
-  // 2. axialToPixel / pixelToAxial 互逆（所有非湖水格子）
   for (let r = 0; r < 13; r++) {
     if (r === 6) continue
     for (let q = 0; q < 9; q++) {
@@ -658,7 +796,6 @@ gameLoop.start()
     }
   }
 
-  // 3. 原点与湖水两侧 y 间隔
   const p00 = HexGrid.axialToPixel(0, 0)
   console.assert(p00.x === 0 && p00.y === 0, 'axialToPixel(0,0) 应为 (0,0)')
   const y5 = HexGrid.axialToPixel(0, 5).y
@@ -666,7 +803,6 @@ gameLoop.start()
   console.assert(y7 - y5 > HexGrid.hexSize * 2,
     `湖水两侧 y 间距应大于 2*size，实际 ${(y7 - y5).toFixed(1)}`)
 
-  // 4. getNeighbors：越界与湖水过滤
   const corner = HexGrid.getNeighbors(0, 0)
   console.assert(corner.length === 3, `角落 (0,0) 应有 3 个邻居，实际 ${corner.length}`)
   console.assert(corner.every(n => HexGrid.isInBounds(n.q, n.r)), '角落邻居不应越界')
@@ -693,7 +829,6 @@ gameLoop.start()
   console.assert(cornerTopRight.every(n => n.q <= 8 && n.r >= 0),
     '右上角落邻居不应越界')
 
-  // 5. findHexAt：命中精度 + 湖水无反应
   for (let r = 0; r < 13; r++) {
     if (r === 6) continue
     for (let q = 0; q < 9; q++) {
@@ -710,7 +845,6 @@ gameLoop.start()
   const oobRight = HexGrid.findHexAt(1200, 200)
   console.assert(oobRight === null, '点击画布右侧远处应返回 null（越界）')
 
-  // 边界像素：略微偏移仍命中正确格
   const p = HexGrid.axialToPixel(4, 3)
   const offset = HexGrid.hexSize * 0.3
   const near = HexGrid.findHexAt(p.x + offset, p.y + offset)
@@ -724,7 +858,6 @@ gameLoop.start()
 // SeededRNG tests
 // ============================================================
 ;(function testSeededRNG() {
-  // 1. 同 seed 产生相同序列
   SeededRNG.init(12345)
   const a = [SeededRNG.next(), SeededRNG.next(), SeededRNG.next()]
   SeededRNG.init(12345)
@@ -732,14 +865,12 @@ gameLoop.start()
   console.assert(a[0] === b[0] && a[1] === b[1] && a[2] === b[2],
     '同 seed 应产生相同序列')
 
-  // 2. 不同 seed 产生不同序列
   SeededRNG.init(1)
   const c = SeededRNG.next()
   SeededRNG.init(2)
   const d = SeededRNG.next()
   console.assert(c !== d, '不同 seed 应产生不同值')
 
-  // 3. 值域 [0, 1)
   SeededRNG.init(99999)
   let inRange = true
   for (let i = 0; i < 10000; i++) {
@@ -748,7 +879,6 @@ gameLoop.start()
   }
   console.assert(inRange, 'next() 应始终在 [0, 1) 范围内')
 
-  // 4. weightedPick 分布检验
   SeededRNG.init(42)
   const counts = { a: 0, b: 0, c: 0 }
   const N = 10000
@@ -761,7 +891,6 @@ gameLoop.start()
   console.assert(counts.c / N > 0.05 && counts.c / N < 0.15,
     `weightedPick c 应约 10%，实际 ${(counts.c / N * 100).toFixed(1)}%`)
 
-  // 5. shuffle 保持元素集合不变
   SeededRNG.init(777)
   const original = [1, 2, 3, 4, 5]
   const shuffled = SeededRNG.shuffle(original)
@@ -769,7 +898,6 @@ gameLoop.start()
   console.assert(shuffled.every(v => original.includes(v)), 'shuffle 元素集合不变')
   console.assert(original[0] === 1 && original[4] === 5, 'shuffle 不修改原数组')
 
-  // 6. nextInt 范围检验
   SeededRNG.init(31415)
   let intOk = true
   for (let i = 0; i < 1000; i++) {
@@ -785,7 +913,6 @@ gameLoop.start()
 // TileSystem tests
 // ============================================================
 ;(function testTileSystem() {
-  // 1. 状态机：inactive → openable 需要相邻己方领地
   const mockRng = {
     next() { return 0.5 },
     weightedPick(options, weights) { return options[0] }
@@ -801,7 +928,6 @@ gameLoop.start()
   console.assert(testTiles['0,0'].state === 'inactive',
     '不相邻己方领地的 inactive 格应保持 inactive')
 
-  // 2. assignTileRng 返回有效 icon 和 price
   SeededRNG.init(42)
   const result = TileSystem.assignTileRng(SeededRNG)
   console.assert(TileSystem.ICONS.includes(result.icon),
@@ -809,7 +935,6 @@ gameLoop.start()
   console.assert([25, 50, 100, 250].includes(result.price),
     `price 应为有效档位，实际: ${result.price}`)
 
-  // 3. 混合池权重分布（统计检验）
   SeededRNG.init(42)
   const iconCounts = { '?': 0, 'helmet': 0, 'shield': 0, 'metal': 0 }
   const N = 10000
@@ -826,7 +951,6 @@ gameLoop.start()
   console.assert(iconCounts['metal'] / N > 0.06 && iconCounts['metal'] / N < 0.14,
     `metal 应约 10%，实际 ${(iconCounts['metal'] / N * 100).toFixed(1)}%`)
 
-  // 4. 价格档位按图标类型差异化
   SeededRNG.init(42)
   const priceByicon = { '?': [], 'helmet': [], 'shield': [], 'metal': [] }
   for (let i = 0; i < N; i++) {
@@ -846,7 +970,6 @@ gameLoop.start()
   console.assert(metalPct50 > 0.40,
     `metal 应偏 50 金（>40%），实际 ${(metalPct50 * 100).toFixed(1)}%`)
 
-  // 5. 状态机单向性：openable 和 opened 格不被重新激活
   const testTiles2 = {
     '4,11': { q: 4, r: 11, owner: 'player', state: 'opened' },
     '3,11': { q: 3, r: 11, owner: null, state: 'openable', icon: '?', price: 25 },
@@ -858,7 +981,6 @@ gameLoop.start()
   console.assert(testTiles2['5,11'].building.type === 'barracks',
     '已 opened 的格子不应被修改')
 
-  // 6. TileSystem.open：25 金档 ? 兵营槽 — "空" 频率 45%-55%
   const N2 = 1000
   const emptyCount25 = { empty: 0 }
   SeededRNG.init(2024)
@@ -870,7 +992,6 @@ gameLoop.start()
   console.assert(emptyRate25 >= 0.45 && emptyRate25 <= 0.55,
     `25 金档 ? 空率应在 45%-55%，实际 ${(emptyRate25 * 100).toFixed(1)}%`)
 
-  // 7. TileSystem.open：250 金档 ? 兵营槽 — 空 0%，紫+金 ≥ 95%
   let empty250 = 0, rareOrGold250 = 0
   SeededRNG.init(2025)
   for (let i = 0; i < N2; i++) {
@@ -882,7 +1003,6 @@ gameLoop.start()
   console.assert(rareOrGold250 / N2 >= 0.95,
     `250 金档 ? 紫+金应 ≥ 95%，实际 ${(rareOrGold250 / N2 * 100).toFixed(1)}%`)
 
-  // 8. TileSystem.open：25 金档头盔 — 永不空
   let helmet25Empty = 0
   SeededRNG.init(2026)
   for (let i = 0; i < N2; i++) {
@@ -891,7 +1011,6 @@ gameLoop.start()
   }
   console.assert(helmet25Empty === 0, `25 金档头盔不应出空，实际 ${helmet25Empty}`)
 
-  // 9. TileSystem.open：盾牌 — 50 金档 / 100 金档 各 50%
   let shield50 = 0, shield100 = 0
   SeededRNG.init(2027)
   for (let i = 0; i < N2; i++) {
@@ -907,7 +1026,6 @@ gameLoop.start()
   console.assert(shield100Rate >= 0.45 && shield100Rate <= 0.55,
     `盾牌 100 金档应约 50%，实际 ${(shield100Rate * 100).toFixed(1)}%`)
 
-  // 10. TileSystem.open：金属 — 100% 出金矿
   let metalMine = 0
   SeededRNG.init(2028)
   for (let i = 0; i < N2; i++) {
@@ -916,7 +1034,6 @@ gameLoop.start()
   }
   console.assert(metalMine === N2, `金属应 100% 出金矿，实际 ${metalMine}/${N2}`)
 
-  // 11. TileSystem.open：同 seed 同输入结果完全一致
   SeededRNG.init(7777)
   const r1 = TileSystem.open({ icon: '?', price: 50 }, SeededRNG)
   SeededRNG.init(7777)
@@ -931,7 +1048,6 @@ gameLoop.start()
 // OpeningLayout tests
 // ============================================================
 ;(function testOpeningLayout() {
-  // 1. 开局生成 6 个已开建筑格
   SeededRNG.init(42)
   const testTiles = {}
   for (let r = 0; r < HexGrid.ROWS; r++) {
@@ -945,7 +1061,6 @@ gameLoop.start()
   console.assert(results.length === 6,
     `开局应生成 6 个建筑格，实际 ${results.length}`)
 
-  // 验证所有开局格子为 opened 且有 building
   const neighbors = HexGrid.getNeighbors(4, 11)
   let openedCount = 0
   for (const n of neighbors) {
@@ -955,12 +1070,18 @@ gameLoop.start()
   console.assert(openedCount === 6,
     `HQ 周围应有 6 个 opened 建筑格，实际 ${openedCount}`)
 
-  // 2. 建筑类型全部有效
   const validTypes = ['barracks', 'archer_tower', 'gold_mine']
   console.assert(results.every(t => validTypes.includes(t)),
     `所有建筑类型应有效，实际: ${results.join(', ')}`)
 
-  // 3. ≥1 金矿概率 70%（统计 1000 次，每次用不同 seed）
+  for (const n of neighbors) {
+    const tile = testTiles[`${n.q},${n.r}`]
+    if (tile && tile.building && tile.building.type === 'barracks') {
+      console.assert(['green','blue','purple','gold'].includes(tile.building.tier),
+        `开局兵营应有 tier，实际 ${tile.building.tier}`)
+    }
+  }
+
   let mineCount = 0
   const TRIALS = 1000
   for (let trial = 0; trial < TRIALS; trial++) {
@@ -979,7 +1100,6 @@ gameLoop.start()
   console.assert(mineRate >= 0.65 && mineRate <= 0.75,
     `≥1 金矿频率应在 65%-75%，实际 ${(mineRate * 100).toFixed(1)}%`)
 
-  // 4. 同 seed 结果一致
   SeededRNG.init(999)
   const tiles1 = {}
   for (let r = 0; r < HexGrid.ROWS; r++) {
@@ -1002,7 +1122,6 @@ gameLoop.start()
   console.assert(JSON.stringify(res1) === JSON.stringify(res2),
     '同 seed 开局结果应完全一致')
 
-  // 5. 双方独立生成
   SeededRNG.init(42)
   const tiles3 = {}
   for (let r = 0; r < HexGrid.ROWS; r++) {
@@ -1029,33 +1148,28 @@ gameLoop.start()
 // ResourceSystem tests
 // ============================================================
 ;(function testResourceSystem() {
-  // 1. 初始金币 60
   ResourceSystem.init()
   console.assert(ResourceSystem.gold.player === 60,
     `玩家初始金币应为 60，实际 ${ResourceSystem.gold.player}`)
   console.assert(ResourceSystem.gold.ai === 60,
     `AI 初始金币应为 60，实际 ${ResourceSystem.gold.ai}`)
 
-  // 2. trySpend 成功扣费
   ResourceSystem.init()
   const ok = ResourceSystem.trySpend('player', 30)
   console.assert(ok === true, 'trySpend(30) 应返回 true')
   console.assert(ResourceSystem.gold.player === 30,
     `扣费后应为 30，实际 ${ResourceSystem.gold.player}`)
 
-  // 3. trySpend 金币不足返回 false，不扣费
   const fail = ResourceSystem.trySpend('player', 50)
   console.assert(fail === false, 'trySpend(50) 金币不足应返回 false')
   console.assert(ResourceSystem.gold.player === 30,
     `扣费失败后应仍为 30，实际 ${ResourceSystem.gold.player}`)
 
-  // 4. trySpend 金额为 0 或负数返回 false
   console.assert(ResourceSystem.trySpend('player', 0) === false,
     'trySpend(0) 应返回 false')
   console.assert(ResourceSystem.trySpend('player', -10) === false,
     'trySpend(-10) 应返回 false')
 
-  // 5. 双方独立金币池
   ResourceSystem.init()
   ResourceSystem.addGold('player', 100)
   console.assert(ResourceSystem.gold.player === 160,
@@ -1063,7 +1177,6 @@ gameLoop.start()
   console.assert(ResourceSystem.gold.ai === 60,
     `addGold 不应影响 AI，实际 ${ResourceSystem.gold.ai}`)
 
-  // 6. HQ 产金：tick 60 次（6 秒）后增加 12
   ResourceSystem.init()
   ResourceSystem.incomeTick = 0
   const emptyTiles = {}
@@ -1078,7 +1191,6 @@ gameLoop.start()
   console.assert(ResourceSystem.gold.ai === 72,
     `6s 后 AI 金币应为 72（60+12），实际 ${ResourceSystem.gold.ai}`)
 
-  // 7. HQ + N 金矿产金
   ResourceSystem.init()
   ResourceSystem.incomeTick = 0
   const mineTiles = {}
@@ -1096,7 +1208,6 @@ gameLoop.start()
   console.assert(ResourceSystem.gold.ai === 82,
     `6s 后 AI 金币应为 82（60+12+1*10），实际 ${ResourceSystem.gold.ai}`)
 
-  // 8. countMines 正确计数
   const mines = ResourceSystem.countMines(mineTiles, 'player')
   console.assert(mines === 2,
     `玩家应有 2 个金矿，实际 ${mines}`)
@@ -1108,13 +1219,210 @@ gameLoop.start()
 })()
 
 // ============================================================
+// UnitTypes tests: 6 兵种数据完整、所有属性 > 0
+// ============================================================
+;(function testUnitTypes() {
+  const keys = Object.keys(UnitTypes.definitions)
+  console.assert(keys.length === 6,
+    `应有 6 个兵种定义，实际 ${keys.length}`)
+
+  for (const key of keys) {
+    const def = UnitTypes.get(key)
+    console.assert(def.hp > 0, `${key}.hp 应 > 0，实际 ${def.hp}`)
+    console.assert(def.atk > 0, `${key}.atk 应 > 0，实际 ${def.atk}`)
+    console.assert(def.speed > 0, `${key}.speed 应 > 0，实际 ${def.speed}`)
+    console.assert(def.cd > 0, `${key}.cd 应 > 0，实际 ${def.cd}`)
+    console.assert(['green','blue','purple','gold'].includes(def.tier),
+      `${key}.tier 应为有效品阶，实际 ${def.tier}`)
+    console.assert(def.trait && def.trait.length > 0,
+      `${key}.trait 应有值`)
+  }
+
+  for (const key of keys) {
+    const def = UnitTypes.get(key)
+    if (def.tier === 'blue') {
+      console.assert(Array.isArray(def.range) && def.range.length === 2,
+        `${key}.range 应为 [近,远] 数组，实际 ${JSON.stringify(def.range)}`)
+      console.assert(def.range[0] > 0 && def.range[1] > 0,
+        `${key}.range 两项都应 > 0`)
+    } else {
+      console.assert(typeof def.range === 'number' && def.range > 0,
+        `${key}.range 应为数字 > 0，实际 ${def.range}`)
+    }
+  }
+
+  console.assert(UnitTypes.tierToUnits.green.length === 2,
+    `绿阶应有 2 种兵种，实际 ${UnitTypes.tierToUnits.green.length}`)
+  console.assert(UnitTypes.tierToUnits.blue.length === 2,
+    `蓝阶应有 2 种兵种，实际 ${UnitTypes.tierToUnits.blue.length}`)
+  console.assert(UnitTypes.tierToUnits.purple.length === 1,
+    `紫阶应有 1 种兵种，实际 ${UnitTypes.tierToUnits.purple.length}`)
+  console.assert(UnitTypes.tierToUnits.gold.length === 1,
+    `金阶应有 1 种兵种，实际 ${UnitTypes.tierToUnits.gold.length}`)
+
+  console.assert(UnitTypes.tierToCd.green === 3, `绿阶 CD 应为 3s`)
+  console.assert(UnitTypes.tierToCd.blue === 4.5, `蓝阶 CD 应为 4.5s`)
+  console.assert(UnitTypes.tierToCd.purple === 6, `紫阶 CD 应为 6s`)
+  console.assert(UnitTypes.tierToCd.gold === 9, `金阶 CD 应为 9s`)
+
+  SeededRNG.init(55)
+  const pick1 = UnitTypes.pickUnitForTier('green', SeededRNG)
+  SeededRNG.init(55)
+  const pick2 = UnitTypes.pickUnitForTier('green', SeededRNG)
+  console.assert(pick1 === pick2, `同 seed pickUnitForTier 应一致: ${pick1} vs ${pick2}`)
+
+  SeededRNG.init(42)
+  const greenPicks = []
+  for (let i = 0; i < 1000; i++) {
+    greenPicks.push(UnitTypes.pickUnitForTier('green', SeededRNG))
+  }
+  console.assert(greenPicks.every(p => p === 'skeleton' || p === 'wolf'),
+    '绿阶 pickUnitForTier 应只出 skeleton/wolf')
+  const skelCount = greenPicks.filter(p => p === 'skeleton').length
+  console.assert(skelCount / 1000 > 0.40 && skelCount / 1000 < 0.60,
+    `绿阶兵种分布应约 50/50，实际骷髅 ${(skelCount / 10).toFixed(1)}%`)
+
+  let threw = false
+  try { UnitTypes.pickUnitForTier('invalid', SeededRNG) } catch(e) { threw = true }
+  console.assert(threw, '无效 tier 应抛错')
+
+  console.log('[test] UnitTypes tests passed')
+})()
+
+// ============================================================
+// BarracksSystem tests: CD 吐兵 + 独立计时 + 重置
+// ============================================================
+;(function testBarracksSystem() {
+  // 1. 绿阶兵营每 30 tick（3s×10Hz）吐出一个单位
+  BarracksSystem.init()
+  const greenTiles = {
+    '3,11': { q: 3, r: 11, owner: 'player', state: 'opened', building: { type: 'barracks', tier: 'green' } }
+  }
+  BarracksSystem.registerBarracks('3,11')
+  const rng1 = { _i: 0, next() { return 0.3 }, weightedPick(o, w) { return o[0] } }
+  for (let i = 0; i < 29; i++) {
+    const spawned = BarracksSystem.tick(greenTiles, rng1)
+    console.assert(spawned.length === 0, `tick ${i+1}: 绿阶兵营不应提前吐兵`)
+  }
+  const spawned30 = BarracksSystem.tick(greenTiles, rng1)
+  console.assert(spawned30.length === 1, `第 30 tick 应吐出 1 个单位，实际 ${spawned30.length}`)
+  console.assert(spawned30[0].tier === 'green', `吐出单位品阶应为 green`)
+  console.assert(spawned30[0].owner === 'player', `吐出单位 owner 应为 player`)
+  console.assert(spawned30[0].hexId === '3,11', `吐出单位 hexId 应为 3,11`)
+  console.assert(spawned30[0].key === 'skeleton', `默认 weightedPick 返回第一个 = skeleton`)
+  console.assert(BarracksSystem.timers['3,11'] === 0, `吐兵后 timer 应重置为 0`)
+
+  // 2. 蓝阶兵营每 45 tick（4.5s×10Hz）吐兵
+  BarracksSystem.init()
+  const blueTiles = {
+    '5,11': { q: 5, r: 11, owner: 'player', state: 'opened', building: { type: 'barracks', tier: 'blue' } }
+  }
+  BarracksSystem.registerBarracks('5,11')
+  const rng2 = { _i: 0, next() { return 0.3 }, weightedPick(o, w) { return o[0] } }
+  for (let i = 0; i < 44; i++) {
+    const s = BarracksSystem.tick(blueTiles, rng2)
+    console.assert(s.length === 0, `蓝阶 tick ${i+1}: 不应提前吐兵`)
+  }
+  const s45 = BarracksSystem.tick(blueTiles, rng2)
+  console.assert(s45.length === 1, `第 45 tick 蓝阶应吐兵，实际 ${s45.length}`)
+  console.assert(s45[0].tier === 'blue', `蓝阶吐兵品阶应为 blue`)
+
+  // 3. 紫阶兵营每 60 tick（6s×10Hz）吐兵
+  BarracksSystem.init()
+  const purpleTiles = {
+    '4,10': { q: 4, r: 10, owner: 'player', state: 'opened', building: { type: 'barracks', tier: 'purple' } }
+  }
+  BarracksSystem.registerBarracks('4,10')
+  const rng3 = { _i: 0, next() { return 0.3 }, weightedPick(o, w) { return o[0] } }
+  for (let i = 0; i < 59; i++) {
+    BarracksSystem.tick(purpleTiles, rng3)
+  }
+  const s60 = BarracksSystem.tick(purpleTiles, rng3)
+  console.assert(s60.length === 1, `第 60 tick 紫阶应吐兵`)
+  console.assert(s60[0].key === 'cavalry', `紫阶只有 cavalry`)
+
+  // 4. 金阶兵营每 90 tick（9s×10Hz）吐兵
+  BarracksSystem.init()
+  const goldTiles = {
+    '4,9': { q: 4, r: 9, owner: 'player', state: 'opened', building: { type: 'barracks', tier: 'gold' } }
+  }
+  BarracksSystem.registerBarracks('4,9')
+  const rng4 = { _i: 0, next() { return 0.3 }, weightedPick(o, w) { return o[0] } }
+  for (let i = 0; i < 89; i++) {
+    BarracksSystem.tick(goldTiles, rng4)
+  }
+  const s90 = BarracksSystem.tick(goldTiles, rng4)
+  console.assert(s90.length === 1, `第 90 tick 金阶应吐兵`)
+  console.assert(s90[0].key === 'dragon', `金阶只有 dragon`)
+
+  // 5. 多个兵营独立计时，互不干扰
+  BarracksSystem.init()
+  const multiTiles = {
+    '3,11': { q: 3, r: 11, owner: 'player', state: 'opened', building: { type: 'barracks', tier: 'green' } },
+    '5,11': { q: 5, r: 11, owner: 'player', state: 'opened', building: { type: 'barracks', tier: 'blue' } }
+  }
+  BarracksSystem.registerBarracks('3,11')
+  BarracksSystem.registerBarracks('5,11')
+  const rng5 = { _i: 0, next() { return 0.3 }, weightedPick(o, w) { return o[0] } }
+
+  for (let i = 0; i < 29; i++) BarracksSystem.tick(multiTiles, rng5)
+  const s30multi = BarracksSystem.tick(multiTiles, rng5)
+  console.assert(s30multi.length === 1, `第 30 tick 多兵营只有绿阶吐兵，实际 ${s30multi.length}`)
+  console.assert(s30multi[0].tier === 'green', `第 30 tick 吐兵应为绿阶`)
+
+  for (let i = 0; i < 14; i++) BarracksSystem.tick(multiTiles, rng5)
+  const s44multi = BarracksSystem.tick(multiTiles, rng5)
+  console.assert(s44multi.length === 1, `第 45 tick 蓝阶应吐兵`)
+  console.assert(s44multi[0].tier === 'blue', `第 45 tick 吐兵应为蓝阶`)
+
+  // 6. 吐兵后 timer 正确重置（下一个周期又能吐兵）
+  BarracksSystem.init()
+  const resetTiles = {
+    '3,11': { q: 3, r: 11, owner: 'player', state: 'opened', building: { type: 'barracks', tier: 'green' } }
+  }
+  BarracksSystem.registerBarracks('3,11')
+  const rng6 = { _i: 0, next() { return 0.3 }, weightedPick(o, w) { return o[0] } }
+  for (let i = 0; i < 30; i++) BarracksSystem.tick(resetTiles, rng6)
+  console.assert(BarracksSystem.units.length === 1, `第一轮应吐出 1 个单位`)
+  for (let i = 0; i < 30; i++) BarracksSystem.tick(resetTiles, rng6)
+  console.assert(BarracksSystem.units.length === 2, `第二轮应再吐出 1 个单位，总计 2`)
+
+  // 7. 开局兵营格子立即开始计时（initGameState 中注册）
+  const gs = initGameState()
+  let barracksCount = 0
+  for (const hexId of Object.keys(gs.tiles)) {
+    const tile = gs.tiles[hexId]
+    if (tile && tile.building && tile.building.type === 'barracks') {
+      barracksCount++
+      console.assert(BarracksSystem.timers[hexId] !== undefined,
+        `开局兵营 ${hexId} 应已在 BarracksSystem.timers 中注册`)
+    }
+  }
+  console.assert(barracksCount > 0,
+    `开局应有兵营格子，实际 ${barracksCount}`)
+
+  // 8. removeBarracks 停止计时
+  BarracksSystem.init()
+  const removeTiles = {
+    '3,11': { q: 3, r: 11, owner: 'player', state: 'opened', building: { type: 'barracks', tier: 'green' } }
+  }
+  BarracksSystem.registerBarracks('3,11')
+  BarracksSystem.removeBarracks('3,11')
+  console.assert(!BarracksSystem.timers['3,11'], `removeBarracks 后 timer 应被删除`)
+  const rng8 = { _i: 0, next() { return 0.3 }, weightedPick(o, w) { return o[0] } }
+  for (let i = 0; i < 30; i++) BarracksSystem.tick(removeTiles, rng8)
+  console.assert(BarracksSystem.units.length === 0, `移除兵营后不应再吐兵`)
+
+  console.log('[test] BarracksSystem tests passed')
+})()
+
+// ============================================================
 // Integration test: initGameState seed determinism
 // ============================================================
 ;(function testGameStateDeterminism() {
   const gs1 = initGameState()
   const gs2 = initGameState()
 
-  // 同 seed 重复开局，所有格子状态完全一致
   let mismatch = 0
   for (const hexId of Object.keys(gs1.tiles)) {
     const t1 = gs1.tiles[hexId]
@@ -1127,7 +1435,6 @@ gameLoop.start()
   console.assert(mismatch === 0,
     `同 seed 两次开局应完全一致，不匹配数: ${mismatch}`)
 
-  // 验证开局格子状态
   const playerHqNeighbors = HexGrid.getNeighbors(PLAYER_HQ.q, PLAYER_HQ.r)
   let playerOpenedBuildings = 0
   for (const n of playerHqNeighbors) {
@@ -1152,7 +1459,6 @@ gameLoop.start()
   console.assert(aiOpenedBuildings === 6,
     `AI HQ 周围应有 6 个已开建筑格，实际 ${aiOpenedBuildings}`)
 
-  // 验证有 openable 格子（与已开领地相邻的 inactive 格被激活）
   let openableCount = 0
   for (const hexId of Object.keys(gs1.tiles)) {
     if (gs1.tiles[hexId].state === 'openable') openableCount++
@@ -1160,7 +1466,6 @@ gameLoop.start()
   console.assert(openableCount > 0,
     `开局后应有 openable 格子，实际 ${openableCount}`)
 
-  // 验证可开格子都有图标和价格
   for (const hexId of Object.keys(gs1.tiles)) {
     const tile = gs1.tiles[hexId]
     if (tile.state === 'openable') {
@@ -1173,11 +1478,11 @@ gameLoop.start()
 
   console.log('[test] GameState determinism + integration tests passed')
 })()
+
 // ============================================================
-// ClickHandler tests: 状态机判定 + 经济 + 激活连锁
+// ClickHandler tests: 状态机判定 + 经济 + 激活连锁 + 兵营注册
 // ============================================================
 ;(function testClickHandler() {
-  // 辅助：构造最小可用的 tiles 状态
   function freshTiles() {
     const tiles = {}
     for (let r = 0; r < HexGrid.ROWS; r++) {
@@ -1188,8 +1493,9 @@ gameLoop.start()
     return tiles
   }
 
-  // 1. 点击 openable 格且金币充足 → 扣费 + 状态变 opened + 写入 building
+  // 1. 点击 openable 格且金币充足
   ResourceSystem.init()
+  BarracksSystem.init()
   ResourceSystem.gold.player = 100
   const t1 = freshTiles()
   t1['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: 'metal', price: 25 }
@@ -1203,8 +1509,9 @@ gameLoop.start()
     `金属应出 gold_mine，实际 ${JSON.stringify(t1['4,10'].building)}`)
   console.assert(t1['4,10'].owner === 'player', 'owner 应保持 player')
 
-  // 2. 点击 openable 格但金币不足 → 不扣费、格子不变、返回通知
+  // 2. 金币不足
   ResourceSystem.init()
+  BarracksSystem.init()
   ResourceSystem.gold.player = 10
   const t2 = freshTiles()
   t2['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: 'metal', price: 25 }
@@ -1215,7 +1522,7 @@ gameLoop.start()
   console.assert(ResourceSystem.gold.player === 10, '金币不应变化')
   console.assert(t2['4,10'].state === 'openable', '状态应保持 openable')
 
-  // 3. 点击 inactive 格 → 无反应
+  // 3. inactive 格
   ResourceSystem.init()
   ResourceSystem.gold.player = 100
   const t3 = freshTiles()
@@ -1224,7 +1531,7 @@ gameLoop.start()
     `inactive 格应返回 not_openable，实际 ${JSON.stringify(r3)}`)
   console.assert(ResourceSystem.gold.player === 100, 'inactive 格不应扣费')
 
-  // 4. 点击 opened 格 → 无反应（不可重复开）
+  // 4. opened 格
   ResourceSystem.init()
   ResourceSystem.gold.player = 100
   const t4 = freshTiles()
@@ -1234,20 +1541,20 @@ gameLoop.start()
     'opened 格应返回 not_openable')
   console.assert(ResourceSystem.gold.player === 100, 'opened 格不应扣费')
 
-  // 5. 点击 null tile（未命中格子）→ 无反应
+  // 5. null tile
   const r5 = ClickHandler.handleTileClick(null, {}, 'player')
   console.assert(r5.ok === false && r5.reason === 'no_tile', 'null tile 应返回 no_tile')
 
-  // 6. 25 金档 ? 开空 → state 变 opened-empty（或 opened + building 为空）
+  // 6. 空结果
   ResourceSystem.init()
+  BarracksSystem.init()
   ResourceSystem.gold.player = 100
   const t6 = freshTiles()
-  // 强制让 open 返回 empty：用一个确定会让 empty 被选中的 seed 进行多次尝试
   t6['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: '?', price: 25 }
   let foundEmpty = false
   for (let seed = 0; seed < 200; seed++) {
     SeededRNG.init(seed)
-    // 重置 tile
+    BarracksSystem.init()
     t6['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: '?', price: 25 }
     ResourceSystem.gold.player = 100
     const r = ClickHandler.handleTileClick(t6['4,10'], t6, 'player')
@@ -1256,20 +1563,21 @@ gameLoop.start()
         '空结果也应将状态设为 opened')
       console.assert(t6['4,10'].building === null,
         '空结果的 building 应为 null')
+      console.assert(!BarracksSystem.timers['4,10'],
+        '空结果不应注册兵营计时器')
       foundEmpty = true
       break
     }
   }
-  console.assert(foundEmpty, '在 200 次尝试中应至少遇到一次空结果（25 金档 50% 空）')
+  console.assert(foundEmpty, '在 200 次尝试中应至少遇到一次空结果')
 
-  // 7. 激活连锁：开出建筑后，其相邻 inactive 格应变为 openable
+  // 7. 激活连锁
   ResourceSystem.init()
+  BarracksSystem.init()
   ResourceSystem.gold.player = 1000
   const t7 = freshTiles()
-  // 仅有一个孤立的 openable 格，周围全是 inactive；开启后邻居应被激活
-  t7['4,6'] = undefined // 湖水位置附近避免干扰
+  t7['4,6'] = undefined
   t7['4,5'] = { q: 4, r: 5, owner: 'player', state: 'openable', icon: 'metal', price: 25 }
-  // 把 (4,5) 周围的 inactive 格子先标 owner=null
   const neighbors = HexGrid.getNeighbors(4, 5)
   for (const n of neighbors) {
     const key = `${n.q},${n.r}`
@@ -1281,11 +1589,11 @@ gameLoop.start()
   const afterOpenable = Object.values(t7).filter(t => t && t.state === 'openable').length
   console.assert(afterOpenable >= beforeOpenable,
     `开启后 openable 数量不应减少: ${beforeOpenable} → ${afterOpenable}`)
-  // 至少有一个新激活的格子（因为 (4,5) 的邻居里有 inactive 且与新 owner=player 的格相邻）
   console.assert(afterOpenable > 0, '开启后应至少激活一个新 openable 格子')
 
-  // 8. 开金矿后立即计入 ResourceSystem.countMines（下一个 tick 就能产金）
+  // 8. 金矿计入产金
   ResourceSystem.init()
+  BarracksSystem.init()
   ResourceSystem.gold.player = 100
   ResourceSystem.incomeTick = 0
   const t8 = freshTiles()
@@ -1294,13 +1602,13 @@ gameLoop.start()
   ClickHandler.handleTileClick(t8['4,10'], t8, 'player')
   const mines = ResourceSystem.countMines(t8, 'player')
   console.assert(mines === 1, `开出金矿后 countMines 应为 1，实际 ${mines}`)
-  // 跑 60 ticks 后金币应增加 12 (HQ) + 10 (金矿) = 22
   for (let i = 0; i < 60; i++) ResourceSystem.tick(t8)
   console.assert(ResourceSystem.gold.player === 97,
     `开金矿后 6s 玩家金币应为 97（75+22），实际 ${ResourceSystem.gold.player}`)
 
-  // 9. 开盾牌：archer_tower 注册，priceTier 写入 building
+  // 9. 盾牌
   ResourceSystem.init()
+  BarracksSystem.init()
   ResourceSystem.gold.player = 200
   const t9 = freshTiles()
   t9['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: 'shield', price: 50 }
@@ -1311,8 +1619,9 @@ gameLoop.start()
   console.assert(t9['4,10'].building.priceTier === 50 || t9['4,10'].building.priceTier === 100,
     `盾牌 priceTier 应为 50 或 100，实际 ${t9['4,10'].building.priceTier}`)
 
-  // 10. 开?兵营槽：非空结果写入 barracks + tier
+  // 10. 兵营槽 + BarracksSystem 注册
   ResourceSystem.init()
+  BarracksSystem.init()
   ResourceSystem.gold.player = 1000
   const t10 = freshTiles()
   t10['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: '?', price: 100 }
@@ -1320,6 +1629,7 @@ gameLoop.start()
   for (let seed = 0; seed < 20; seed++) {
     t10['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: '?', price: 100 }
     ResourceSystem.gold.player = 1000
+    BarracksSystem.init()
     SeededRNG.init(seed + 1000)
     const r = ClickHandler.handleTileClick(t10['4,10'], t10, 'player')
     if (r.result && r.result.type === 'barracks') {
@@ -1327,6 +1637,8 @@ gameLoop.start()
         '非空 ? 结果应写入 barracks building')
       console.assert(['green','blue','purple','gold'].includes(t10['4,10'].building.tier),
         `barracks 应有有效 tier，实际 ${t10['4,10'].building.tier}`)
+      console.assert(BarracksSystem.timers['4,10'] !== undefined,
+        `兵营格子应在 BarracksSystem 中注册`)
       barracksCount++
       if (barracksCount >= 3) break
     }
