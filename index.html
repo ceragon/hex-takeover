@@ -76,19 +76,193 @@ function createGameLoop(updateFn) {
 }
 
 // ============================================================
-// Minimal GameState placeholder
+// HexGrid: 六边形网格坐标计算与渲染
 // ============================================================
-const GameState = {
-  playerGold: 0,
-  aiGold: 0,
+const HexGrid = {
+  cols: 5,
+  rows: 7,
+  hexSize: 32,
+
+  // 生成 5×7 网格的所有轴向坐标 (q, r)
+  generateCoords(cols, rows) {
+    const coords = [];
+    for (let r = 0; r < rows; r++) {
+      for (let q = 0; q < cols; q++) {
+        coords.push({ q, r });
+      }
+    }
+    return coords;
+  },
+
+  // 平顶六边形：轴向坐标 → 像素中心点
+  hexToPixel(q, r, size) {
+    const x = size * (Math.sqrt(3) * q + Math.sqrt(3) / 2 * r);
+    const y = size * (1.5 * r);
+    return { x, y };
+  }
 };
 
 // ============================================================
-// UI update placeholder
+// TileReveal: 翻牌逻辑、地块内容生成
+// ============================================================
+const TileReveal = {
+  // 地块类型权重: 40%金矿 / 30%空地 / 20%野怪 / 10%特殊
+  TILE_TYPES: [
+    { type: 'mine', weight: 40 },
+    { type: 'empty', weight: 30 },
+    { type: 'monster', weight: 20 },
+    { type: 'special', weight: 10 }
+  ],
+
+  // 简单种子随机数生成器
+  seededRandom(seed) {
+    let s = seed;
+    return function() {
+      s = (s * 16807 + 0) % 2147483647;
+      return (s - 1) / 2147483646;
+    };
+  },
+
+  // 根据权重选择地块类型
+  pickTileType(rng) {
+    const roll = rng() * 100;
+    let cumulative = 0;
+    for (const t of this.TILE_TYPES) {
+      cumulative += t.weight;
+      if (roll < cumulative) return t.type;
+    }
+    return this.TILE_TYPES[this.TILE_TYPES.length - 1].type;
+  },
+
+  // 使用固定种子生成地图地块分布
+  generateMap(cols, rows, seed = 42) {
+    const rng = this.seededRandom(seed);
+    const coords = HexGrid.generateCoords(cols, rows);
+    const tiles = {};
+
+    for (const { q, r } of coords) {
+      const key = `${q},${r}`;
+      tiles[key] = {
+        q, r,
+        revealed: false,
+        type: this.pickTileType(rng),
+        owner: 'neutral'
+      };
+    }
+
+    // 大本营：玩家端 r=0 中间列，AI 端 r=rows-1 中间列
+    const midCol = Math.floor(cols / 2);
+    const playerBaseKey = `${midCol},0`;
+    const aiBaseKey = `${midCol},${rows - 1}`;
+
+    tiles[playerBaseKey].revealed = true;
+    tiles[playerBaseKey].type = 'base';
+    tiles[playerBaseKey].owner = 'player';
+
+    tiles[aiBaseKey].revealed = true;
+    tiles[aiBaseKey].type = 'base';
+    tiles[aiBaseKey].owner = 'ai';
+
+    return { tiles, playerBase: playerBaseKey, aiBase: aiBaseKey };
+  },
+
+  // 尝试翻牌：消耗金币，返回翻牌结果
+  reveal(tileKey, tiles, playerGold, cost = 10) {
+    const tile = tiles[tileKey];
+    if (!tile || tile.revealed) {
+      return { success: false, reason: tile ? 'already revealed' : 'invalid tile' };
+    }
+    if (playerGold < cost) {
+      return { success: false, reason: 'not enough gold' };
+    }
+    tile.revealed = true;
+    return { success: true, newGold: playerGold - cost, tileType: tile.type };
+  }
+};
+
+// ============================================================
+// Embedded assertions: HexGrid coordinate generation
+// ============================================================
+(function testHexGrid() {
+  const coords = HexGrid.generateCoords(5, 7);
+  console.assert(coords.length === 35, `HexGrid should generate 35 coords for 5x7, got ${coords.length}`);
+
+  // 检查边界坐标
+  console.assert(coords[0].q === 0 && coords[0].r === 0, 'First coord should be (0,0)');
+  console.assert(coords[34].q === 4 && coords[34].r === 6, 'Last coord should be (4,6)');
+
+  // 检查像素坐标计算
+  const px = HexGrid.hexToPixel(0, 0, 32);
+  console.assert(px.x === 0 && px.y === 0, 'hexToPixel(0,0) should be (0,0)');
+
+  const px2 = HexGrid.hexToPixel(1, 0, 32);
+  console.assert(Math.abs(px2.x - 32 * Math.sqrt(3)) < 0.001, 'hexToPixel(1,0) x should be size*sqrt(3)');
+  console.assert(px2.y === 0, 'hexToPixel(1,0) y should be 0 for same row');
+
+  console.log('[test] HexGrid coordinate tests passed');
+})();
+
+// ============================================================
+// Embedded assertions: TileReveal map generation
+// ============================================================
+(function testTileReveal() {
+  // 测试固定种子可复现
+  const map1 = TileReveal.generateMap(5, 7, 42);
+  const map2 = TileReveal.generateMap(5, 7, 42);
+  console.assert(JSON.stringify(map1.tiles) === JSON.stringify(map2.tiles), 'Same seed should produce identical maps');
+
+  // 测试大本营位置
+  console.assert(map1.tiles['2,0'].revealed === true, 'Player base at (2,0) should be revealed');
+  console.assert(map1.tiles['2,0'].type === 'base', 'Player base type should be "base"');
+  console.assert(map1.tiles['2,0'].owner === 'player', 'Player base owner should be "player"');
+  console.assert(map1.tiles['2,6'].revealed === true, 'AI base at (2,6) should be revealed');
+  console.assert(map1.tiles['2,6'].owner === 'ai', 'AI base owner should be "ai"');
+
+  // 测试其他格子初始为迷雾
+  console.assert(map1.tiles['0,1'].revealed === false, 'Non-base tiles should start as fog');
+
+  // 测试翻牌消耗
+  const result = TileReveal.reveal('0,1', map1.tiles, 15);
+  console.assert(result.success === true, 'Reveal with enough gold should succeed');
+  console.assert(result.newGold === 5, 'Gold should be reduced by 10');
+  console.assert(map1.tiles['0,1'].revealed === true, 'Tile should be revealed after success');
+
+  // 测试金币不足
+  const failResult = TileReveal.reveal('1,1', map1.tiles, 5);
+  console.assert(failResult.success === false, 'Reveal with insufficient gold should fail');
+  console.assert(failResult.reason === 'not enough gold', 'Fail reason should be "not enough gold"');
+
+  // 测试已翻牌
+  const dupResult = TileReveal.reveal('0,1', map1.tiles, 100);
+  console.assert(dupResult.success === false, 'Revealing already revealed tile should fail');
+
+  console.log('[test] TileReveal tests passed');
+})();
+
+// ============================================================
+// GameState initialization
+// ============================================================
+const MAP_COLS = 5;
+const MAP_ROWS = 7;
+const MAP_SEED = 42;
+
+function initGameState() {
+  const map = TileReveal.generateMap(MAP_COLS, MAP_ROWS, MAP_SEED);
+  return {
+    playerGold: 50,  // 初始金币
+    aiGold: 50,
+    ...map
+  };
+}
+
+let gameState = initGameState();
+
+// ============================================================
+// UI update
 // ============================================================
 function updateUI() {
-  document.getElementById('player-gold').textContent = `玩家: ${GameState.playerGold} 金`;
-  document.getElementById('ai-gold').textContent = `AI: ${GameState.aiGold} 金`;
+  document.getElementById('player-gold').textContent = `玩家: ${gameState.playerGold} 金`;
+  document.getElementById('ai-gold').textContent = `AI: ${gameState.aiGold} 金`;
 }
 
 // ============================================================
@@ -97,13 +271,162 @@ function updateUI() {
 const canvas = document.getElementById('game-canvas');
 const ctx = canvas.getContext('2d');
 
-function render() {
+// 地块颜色映射
+const TILE_COLORS = {
+  fog: '#2a2a4a',
+  mine: '#b8860b',
+  empty: '#4a6741',
+  monster: '#8b0000',
+  special: '#4b0082',
+  base_player: '#2266cc',
+  base_ai: '#cc2222'
+};
+
+// 绘制单个六边形（平顶）
+function drawHex(cx, cy, size, fillColor, strokeColor = '#333') {
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const angle = Math.PI / 180 * (60 * i - 30);
+    const x = cx + size * Math.cos(angle);
+    const y = cy + size * Math.sin(angle);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.closePath();
+  ctx.fillStyle = fillColor;
+  ctx.fill();
+  ctx.strokeStyle = strokeColor;
+  ctx.stroke();
+}
+
+// 绘制文字在六边形中心
+function drawHexLabel(cx, cy, text, fontSize = 10, color = '#fff') {
+  ctx.fillStyle = color;
+  ctx.font = `${fontSize}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, cx, cy);
+}
+
+// ============================================================
+// Render the full grid
+// ============================================================
+function renderGrid() {
+  if (!gameState) return;
+  const { tiles } = gameState;
+  const size = HexGrid.hexSize;
+
   ctx.fillStyle = '#0a0a1a';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = '#666';
-  ctx.font = '14px monospace';
-  ctx.textAlign = 'center';
-  ctx.fillText('Hex Map (TODO)', canvas.width / 2, canvas.height / 2);
+
+  for (const key of Object.keys(tiles)) {
+    const tile = tiles[key];
+    const { x, y } = HexGrid.hexToPixel(tile.q, tile.r, size);
+
+    // 偏移使地图居中
+    const offsetX = 100;
+    const offsetY = 100;
+    const cx = x + offsetX;
+    const cy = y + offsetY;
+
+    let color;
+    if (!tile.revealed) {
+      color = TILE_COLORS.fog;
+    } else if (tile.type === 'base') {
+      color = tile.owner === 'player' ? TILE_COLORS.base_player : TILE_COLORS.base_ai;
+    } else {
+      color = TILE_COLORS[tile.type] || TILE_COLORS.fog;
+    }
+
+    drawHex(cx, cy, size - 1, color);
+
+    // 已翻开的显示类型标签
+    if (tile.revealed) {
+      const labels = { mine: '金矿', empty: '空地', monster: '野怪', special: '特殊', base: '大本营' };
+      drawHexLabel(cx, cy, labels[tile.type] || '', 9);
+    }
+  }
+}
+
+function render() {
+  renderGrid();
+}
+
+// ============================================================
+// Click handling: reveal tiles on click
+// ============================================================
+canvas.addEventListener('click', (event) => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = event.clientX - rect.left;
+  const my = event.clientY - rect.top;
+
+  // Find which hex was clicked
+  const clickedHex = findHexAt(mx, my);
+  if (!clickedHex) return;
+
+  const tileKey = `${clickedHex.q},${clickedHex.r}`;
+  const result = TileReveal.reveal(tileKey, gameState.tiles, gameState.playerGold);
+
+  if (result.success) {
+    gameState.playerGold = result.newGold;
+    // 金矿立即给予启动资金
+    if (result.tileType === 'mine') {
+      gameState.playerGold += 50;
+    }
+  } else {
+    // 金币不足提示
+    if (result.reason === 'not enough gold') {
+      showNotification('金币不足！');
+    }
+  }
+  updateUI();
+  render();
+});
+
+// 查找鼠标位置对应的六边形（通过最近距离匹配）
+function findHexAt(mx, my) {
+  const { tiles } = gameState;
+  const size = HexGrid.hexSize;
+  const offsetX = 100;
+  const offsetY = 100;
+
+  let closest = null;
+  let closestDist = Infinity;
+
+  for (const key of Object.keys(tiles)) {
+    const tile = tiles[key];
+    const { x, y } = HexGrid.hexToPixel(tile.q, tile.r, size);
+    const cx = x + offsetX;
+    const cy = y + offsetY;
+
+    const dist = Math.sqrt((mx - cx) ** 2 + (my - cy) ** 2);
+    if (dist < closestDist && dist < size) {
+      closestDist = dist;
+      closest = tile;
+    }
+  }
+  return closest;
+}
+
+// 简单通知提示
+let notificationText = '';
+let notificationTimer = 0;
+
+function showNotification(text, duration = 1500) {
+  notificationText = text;
+  notificationTimer = duration;
+}
+
+function renderNotification() {
+  if (notificationTimer > 0) {
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillRect(canvas.width / 2 - 60, canvas.height - 40, 120, 30);
+    ctx.fillStyle = '#fff';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(notificationText, canvas.width / 2, canvas.height - 25);
+  }
 }
 
 // ============================================================
@@ -112,7 +435,12 @@ function render() {
 let tickCount = 0;
 const gameLoop = createGameLoop(() => {
   tickCount++;
+  if (notificationTimer > 0) {
+    notificationTimer -= 100;
+    if (notificationTimer <= 0) notificationText = '';
+  }
   render();
+  renderNotification();
   updateUI();
 });
 
