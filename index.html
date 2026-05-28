@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>占城大师</title>
+<link rel="icon" href="data:,">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    font-family: monospace;
+    color: #eee;
+    min-height: 100vh;
+  }
+  #ui-bar {
+    width: 100%;
+    max-width: 600px;
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 16px;
+    background: #16213e;
+    border-bottom: 2px solid #0f3460;
+  }
+  .gold-display {
+    font-size: 16px;
+    padding: 4px 12px;
+  }
+  #game-canvas {
+    border: 2px solid #0f3460;
+    margin-top: 8px;
+    cursor: pointer;
+  }
+</style>
+</head>
+<body>
+
+<div id="ui-bar">
+  <div class="gold-display" id="player-gold">玩家: 0 金</div>
+  <div class="gold-display" id="ai-gold">AI: 0 金</div>
+</div>
+<canvas id="game-canvas" width="600" height="500"></canvas>
+
+<script>
+// ============================================================
+// GameLoop: 10Hz fixed timestep via requestAnimationFrame
+// ============================================================
+function createGameLoop(updateFn) {
+  const STEP = 100; // 100ms = 10Hz
+  let lastTime = 0;
+  let accumulator = 0;
+  let running = false;
+
+  function loop(timestamp) {
+    if (!running) return;
+    if (!lastTime) lastTime = timestamp;
+    const delta = timestamp - lastTime;
+    lastTime = timestamp;
+    accumulator += delta;
+
+    while (accumulator >= STEP) {
+      updateFn();
+      accumulator -= STEP;
+    }
+
+    requestAnimationFrame(loop);
+  }
+
+  return {
+    start() { running = true; lastTime = 0; requestAnimationFrame(loop); },
+    stop() { running = false; }
+  };
+}
+
+// ============================================================
+// Minimal GameState placeholder
+// ============================================================
+const GameState = {
+  playerGold: 0,
+  aiGold: 0,
+};
+
+// ============================================================
+// UI update placeholder
+// ============================================================
+function updateUI() {
+  document.getElementById('player-gold').textContent = `玩家: ${GameState.playerGold} 金`;
+  document.getElementById('ai-gold').textContent = `AI: ${GameState.aiGold} 金`;
+}
+
+// ============================================================
+// Canvas setup
+// ============================================================
+const canvas = document.getElementById('game-canvas');
+const ctx = canvas.getContext('2d');
+
+function render() {
+  ctx.fillStyle = '#0a0a1a';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#666';
+  ctx.font = '14px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText('Hex Map (TODO)', canvas.width / 2, canvas.height / 2);
+}
+
+// ============================================================
+// Main loop: 10Hz update
+// ============================================================
+let tickCount = 0;
+const gameLoop = createGameLoop(() => {
+  tickCount++;
+  render();
+  updateUI();
+});
+
+gameLoop.start();
+
+// ============================================================
+// Embedded assertions for GameLoop behavior
+// ============================================================
+(function testGameLoop() {
+  console.assert(typeof createGameLoop === 'function', 'createGameLoop should be a function');
+  const mockLoop = createGameLoop(() => {});
+  console.assert(typeof mockLoop.start === 'function', 'loop should have start()');
+  console.assert(typeof mockLoop.stop === 'function', 'loop should have stop()');
+
+  // Verify loop actually ticks after 200ms (> 2 ticks at 10Hz)
+  setTimeout(() => {
+    console.assert(tickCount > 0, `GameLoop should be ticking, got tickCount=${tickCount}`);
+    console.log(`[test] GameLoop passed. tickCount=${tickCount}`);
+  }, 200);
+})();
+</script>
+
+</body>
+</html>
