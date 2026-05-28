@@ -133,14 +133,15 @@ initGameState() → main loop → UI/render → click handling → tests
 ## Known Pitfalls
 
 <!-- Keep updated, max ~8-9 entries -->
-- **v2 OpeningLayout 金矿概率数学：** P(≥1 金矿 in 6 slots) = 1 - (1-p)^6。要得到 70%，需 p ≈ 18%（即 0.82^6 ≈ 0.30），**不是**直觉上的 35%（0.65^6 ≈ 0.075，实际给 92.5%）。指数衰减很容易误算，改权重前先手算验证。
-- **v2 统计测试必须用 SeededRNG：** 简单 LCG mock `(s * 1103515245 + 12345) & 0x7fffffff` 低位比特周期短，weightedPick 分布严重偏移（如预期 70% 金矿实测 93%）。统计检验**必须用 SeededRNG（mulberry32）+ 不同 seed**，不要用临时 LCG mock。
-- **v2 `activateOpenableTiles` 必须对 tiles[hexId] 做 undefined 守卫：** 循环 `for (hexId of Object.keys(tiles))` 拿到的 key 对应的 tile 可能是 `undefined`（ClickHandler 等测试用"仅含少量键"的孤立 tiles dict 调用时），访问 `tile.state` 会抛 `Cannot read properties of undefined (reading 'state')`，且错误栈无模块定位。**修复：循环第一句加 `if (!tile) continue`**。
-- **v2 OpeningLayout 兵营必须带 tier：** `OpeningLayout.generateOpening` 生成 `barracks` 类型建筑时**必须同时分配 tier**（如 `building: { type: 'barracks', tier: 'green' }`）。BarracksSystem.tick 访问 `tile.building.tier` 得到 undefined → `UnitTypes.tierToCd[undefined]` = undefined → 乘 10 = NaN → 永远不吐兵。**修复：OpeningLayout 中 barracks 随机分配 tier（权重 50/30/15/5%）**。
-- **v2 HexGrid 实际是 pointy-top（非文档声称的 flat-top）：** `axialToPixel` 用 `(1.5 * r)` 公式，这是 **pointy-top** 而非 flat-top。`getNeighbors` 偏移表必须匹配 pointy-top odd-r 约定（even: `[0,-1],[-1,-1],[1,1],[0,1]`，odd: `[1,-1],[0,-1],[0,1],[-1,1]`），否则邻居关系不对称（A→B 成立但 B→A 不成立）。改偏移前**先用 `Math.hypot` 验证像素距离 = √3·size**。
+- **v2 HexGrid 实际是 pointy-top even-r 偏移：** `axialToPixel` 用 `(1.5 * r)` 公式是 pointy-top；cube distance 必须用 **even-r 偏移 `ax = q - floor(r/2)`**（不是 odd-r 的 `q + floor(r/2)`，AGENTS 曾误写为 odd-r）。`getNeighbors` 偏移表必须匹配 even-r 约定，否则邻居关系不对称。改偏移前**先用 `Math.hypot` 验证像素距离 = √3·size**。
 - **v2 湖水格必须可通行（视觉装饰而非移动屏障）：** 六边形邻居只覆盖 ±1 行，若 `getNeighbors` 和 BFS 过滤 r=LAKE_ROW，地图上下两半完全断开，单位无法跨越。**修复：`getNeighbors` 不再过滤湖水格，BFS 不再跳过湖水，渲染保留蓝色视觉带**。
 - **v2 computeBFS 返回的 path 包含目标格本身：** path[0] 是第一步，path[last] 是目标格。相邻目标返回 length=1（而非 0）。tick() 中 `path[0]` 是单位的下一步目标格。单位移动到敌方格子时触发 TerritorySystem.claim。
 - **v2 测试手动构造 unit 必须带 speed 字段：** MoveUnits.tick 读 `unit.speed` 计算 `moveProgress += speed/10`。遗漏 speed → `undefined/10 = NaN` → moveProgress 永远 NaN → 单位不动。**修复：测试 unit 字面量必须含 `speed: UnitTypes.get(key).speed`**。
+- **v2 cube distance vs 像素距离：** `axialToPixel` 返回的坐标经 `Math.hypot` 算出的距离比格子数大 √3 倍（如相邻格像素距离 ≈ 52px，但 cube distance = 1）。射程比较（`range: 3.5`）必须用 cube distance，**不是**像素距离。CombatSystem._hexDist 和 MoveUnits.canAttackFromHere 都用 cube distance。
+- **v2 building.attackCd NaN 陷阱：** 建筑 attackCd 初始是 `undefined`，`Math.max(0, undefined - 1) = NaN`，之后 `NaN > 0` 为 false，导致箭塔/HQ 永远不攻击。**修复：递减前加双条件守卫 `if (tile.building.attackCd !== undefined && tile.building.attackCd > 0)`**；新建筑也可主动初始化 `attackCd: 0`。
+- **v2 resolveUnitAttack 金阶 mode 必须直接用 unit.mode：** 若先按距离算 `mode = dist > 1.2 ? 'ranged' : 'melee'` 再用 `if (gold) mode = unit.mode...` 覆盖，AOE 判断（`mode === 'ranged'`）会读错值。金阶分支**必须直接** `mode = unit.mode === 'melee' ? 'melee' : 'ranged'`，非金阶才走距离判断。
+- **v2 测试 IIFE 污染全局 gameState：** 每个测试的 `resetAll()` 调用各系统 `.init()` 清空全局状态（如 `BarracksSystem.init()` 清空 timers，把 `initGameState()` 注册的兵营全删掉，游戏循环永不吐兵）。**修复：所有测试 IIFE 执行完后 `gameState = initGameState()` 重新初始化**。
+- **v2 死亡单位 splice 后数组索引失效：** `CombatSystem._cleanup` 用 `splice` 移除 hp≤0 的单位，导致测试里 `u[2]` 可能指向错误对象或 undefined。**修复：测试中用 `.find(u => u.hexId === '...')` 按 hexId 查找存活单位，不用硬编码下标**。
 
 ## Core Numbers
 
