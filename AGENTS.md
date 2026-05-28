@@ -141,8 +141,7 @@ initGameState() → main loop → UI/render → click handling → tests
 - **v2 OpeningLayout 金矿概率数学：** P(≥1 金矿 in 6 slots) = 1 - (1-p)^6。要得到 70%，需 p ≈ 18%（即 0.82^6 ≈ 0.30），**不是**直觉上的 35%（0.65^6 ≈ 0.075，实际给 92.5%）。指数衰减很容易误算，改权重前先手算验证。
 - **v2 统计测试必须用 SeededRNG：** 简单 LCG mock `(s * 1103515245 + 12345) & 0x7fffffff` 低位比特周期短，weightedPick 分布严重偏移（如预期 70% 金矿实测 93%）。统计检验**必须用 SeededRNG（mulberry32）+ 不同 seed**，不要用临时 LCG mock。
 - **v2 `activateOpenableTiles` 必须对 tiles[hexId] 做 undefined 守卫：** 循环 `for (hexId of Object.keys(tiles))` 拿到的 key 对应的 tile 可能是 `undefined`（ClickHandler 等测试用"仅含少量键"的孤立 tiles dict 调用时），访问 `tile.state` 会抛 `Cannot read properties of undefined (reading 'state')`，且错误栈无模块定位。**修复：循环第一句加 `if (!tile) continue`**。
-- **Playwright 坐标系统：canvas-offset vs viewport-offset：** `page.mouse.click(x, y)` 接收 viewport 坐标（相对于视口左上角），不是 canvas 内部像素坐标。第一版 E2E 脚本把 probe 写成 canvas 内坐标直调，所有 click 都落到 canvas 外导致"找不到可点格子"。**正确写法**：`const box = await canvas.boundingBox(); await page.mouse.click(box.x + canvasOffsetX, box.y + canvasOffsetY)`。
-- **Playwright E2E 中 ResourceSystem.tick 造成 gold 数值噪声：** 10Hz 主循环在游戏启动后一直跑，HQ 每 6 秒 +12 金（金矿 +10）。E2E probe 耗时数秒，"gold 变化 = 开格子" 的断言会被收入 tick 污染（如 60→875 看似离谱实为收入 + 多次开启）。**应对**：E2E 只断言"行为发生"（state 翻转 / tile 数量 / gold 方向），精确数值断言留给纯逻辑 IIFE 测试。
+- **v2 OpeningLayout 兵营必须带 tier：** `OpeningLayout.generateOpening` 生成 `barracks` 类型建筑时**必须同时分配 tier**（如 `building: { type: 'barracks', tier: 'green' }`）。BarracksSystem.tick 访问 `tile.building.tier` 得到 undefined → `UnitTypes.tierToCd[undefined]` = undefined → 乘 10 = NaN → 永远不吐兵。**修复：OpeningLayout 中 barracks 随机分配 tier（权重 50/30/15/5%）**。
 
 ## Core Numbers
 
