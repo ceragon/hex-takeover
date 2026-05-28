@@ -232,6 +232,22 @@ const TileSystem = {
     'metal':  [10, 55, 25, 10]
   },
 
+  // 兵营槽 (?)：按档位查兵种品阶概率（含"空"）
+  BARRACKS_PROB: {
+    25:  { empty: 50, green: 25, blue: 15, purple: 7.5, gold: 2.5 },
+    50:  { empty: 0,  green: 50, blue: 30, purple: 15,  gold: 5 },
+    100: { empty: 0,  green: 0,  blue: 50, purple: 40,  gold: 10 },
+    250: { empty: 0,  green: 0,  blue: 0,  purple: 50,  gold: 50 }
+  },
+
+  // 头盔：按档位查兵种品阶概率（永不空）
+  HELMET_PROB: {
+    25:  { green: 50, blue: 35, purple: 12, gold: 3 },
+    50:  { green: 20, blue: 50, purple: 22, gold: 8 },
+    100: { green: 0,  blue: 30, purple: 50, gold: 20 },
+    250: { green: 0,  blue: 0,  purple: 40, gold: 60 }
+  },
+
   assignTileRng(rng) {
     const icon = rng.weightedPick(this.ICONS, this.ICON_WEIGHTS)
     const prices = this.PRICE_BY_ICON[icon]
@@ -240,10 +256,46 @@ const TileSystem = {
     return { icon, price }
   },
 
+  // 开地块：按 icon + price 走二次概率表，返回 BuildingResult
+  // 返回值形态：
+  //   { type: 'empty' }                           // 仅 25 金档 ? 可能
+  //   { type: 'barracks', tier: 'green'|'blue'|'purple'|'gold' }
+  //   { type: 'unit_card', tier: 'green'|'blue'|'purple'|'gold' }  // 已确定兵种（头盔产出）
+  //   { type: 'archer_tower', priceTier: 50|100 }
+  //   { type: 'gold_mine' }
+  open({ icon, price }, rng) {
+    if (icon === '?') {
+      const table = this.BARRACKS_PROB[price]
+      const pick = rng.weightedPick(
+        ['empty', 'green', 'blue', 'purple', 'gold'],
+        [table.empty, table.green, table.blue, table.purple, table.gold]
+      )
+      if (pick === 'empty') return { type: 'empty' }
+      return { type: 'barracks', tier: pick }
+    }
+    if (icon === 'helmet') {
+      const table = this.HELMET_PROB[price]
+      const tier = rng.weightedPick(
+        ['green', 'blue', 'purple', 'gold'],
+        [table.green, table.blue, table.purple, table.gold]
+      )
+      return { type: 'unit_card', tier }
+    }
+    if (icon === 'shield') {
+      const priceTier = rng.weightedPick([50, 100], [50, 50])
+      return { type: 'archer_tower', priceTier }
+    }
+    if (icon === 'metal') {
+      return { type: 'gold_mine' }
+    }
+    throw new Error(`TileSystem.open: unknown icon "${icon}"`)
+  },
+
   activateOpenableTiles(tiles, rng) {
     const activated = []
     for (const hexId of Object.keys(tiles)) {
       const tile = tiles[hexId]
+      if (!tile) continue
       if (tile.state !== 'inactive') continue
       const neighbors = HexGrid.getNeighbors(tile.q, tile.r)
       const adjToOwned = neighbors.some(n => {
@@ -341,6 +393,71 @@ const ResourceSystem = {
         this.gold[side] += this.countMines(tiles, side) * 10
       }
     }
+  }
+}
+
+// ============================================================
+// showNotification: 屏幕上方短暂提示（slice 9 打磨视觉）
+// ============================================================
+let _notificationEl = null
+let _notificationTimer = null
+function showNotification(msg) {
+  if (typeof document === 'undefined') return
+  if (!_notificationEl) {
+    _notificationEl = document.createElement('div')
+    _notificationEl.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);' +
+      'background:#222;border:1px solid #f66;color:#fff;padding:6px 14px;font-family:monospace;' +
+      'font-size:14px;border-radius:4px;pointer-events:none;opacity:0;transition:opacity 0.2s;z-index:10'
+    document.body.appendChild(_notificationEl)
+  }
+  _notificationEl.textContent = msg
+  _notificationEl.style.opacity = '1'
+  clearTimeout(_notificationTimer)
+  _notificationTimer = setTimeout(() => {
+    if (_notificationEl) _notificationEl.style.opacity = '0'
+  }, 1500)
+}
+
+// ============================================================
+// ClickHandler: 开地块核心动作
+// handleTileClick(tile, tiles, player) → { ok, reason?, result? }
+// ============================================================
+const ClickHandler = {
+  handleTileClick(tile, tiles, player) {
+    if (!tile) return { ok: false, reason: 'no_tile' }
+    if (tile.state !== 'openable') return { ok: false, reason: 'not_openable' }
+    // 只能开自己领地相邻激活的格子（owner=null 或 owner=player 都可开，但不能开 AI 的）
+    if (tile.owner && tile.owner !== player) return { ok: false, reason: 'not_openable' }
+
+    if (!ResourceSystem.trySpend(player, tile.price)) {
+      if (player === 'player') showNotification('金币不足')
+      return { ok: false, reason: 'insufficient_gold' }
+    }
+
+    const result = TileSystem.open({ icon: tile.icon, price: tile.price }, SeededRNG)
+
+    tile.owner = player
+    tile.state = 'opened'
+    delete tile.icon
+    delete tile.price
+
+    if (result.type === 'empty') {
+      tile.building = null
+    } else if (result.type === 'barracks') {
+      tile.building = { type: 'barracks', tier: result.tier }
+    } else if (result.type === 'unit_card') {
+      // 头盔：已确定兵种，行为与 barracks 等价（slice 4 处理吐兵）
+      tile.building = { type: 'barracks', tier: result.tier, card: true }
+    } else if (result.type === 'archer_tower') {
+      tile.building = { type: 'archer_tower', priceTier: result.priceTier }
+    } else if (result.type === 'gold_mine') {
+      tile.building = { type: 'gold_mine' }
+    }
+
+    // 激活连锁：新领地周围的 inactive 格变 openable
+    TileSystem.activateOpenableTiles(tiles, SeededRNG)
+
+    return { ok: true, result }
   }
 }
 
@@ -444,16 +561,19 @@ function renderGrid() {
           labelSize = 9
         } else if (tile.building.type === 'barracks') {
           color = tile.owner === 'player' ? '#1a5a2a' : '#5a1a1a'
-          label = '兵'
+          const tierMap = { green: '绿', blue: '蓝', purple: '紫', gold: '金' }
+          label = tile.building.card ? '卡' : '兵'
+          subLabel = tierMap[tile.building.tier] || ''
         } else if (tile.building.type === 'archer_tower') {
           color = tile.owner === 'player' ? '#1a4a3a' : '#4a1a2a'
           label = '塔'
+          subLabel = tile.building.priceTier === 100 ? 'II' : 'I'
         } else if (tile.building.type === 'gold_mine') {
           color = tile.owner === 'player' ? '#4a4a1a' : '#4a2a1a'
           label = '矿'
         }
       } else if (tile.state === 'opened') {
-        color = '#2a2a3a'
+        color = tile.owner === 'player' ? '#2a2a3a' : (tile.owner === 'ai' ? '#3a2a2a' : '#2a2a3a')
         label = '空'
       } else if (tile.state === 'openable') {
         color = '#4a3a6a'
@@ -494,7 +614,11 @@ canvas.addEventListener('click', (event) => {
   const hex = HexGrid.findHexAt(mx, my)
   if (!hex) return
   const tile = gameState.tiles[`${hex.q},${hex.r}`]
-  console.log(`[click] q=${hex.q}, r=${hex.r} state=${tile ? tile.state : '?'}`)
+  if (!tile) return
+  const result = ClickHandler.handleTileClick(tile, gameState.tiles, 'player')
+  if (result.ok) {
+    render()
+  }
 })
 
 // ============================================================
@@ -733,6 +857,72 @@ gameLoop.start()
     '已 openable 的格子不应被重新分配')
   console.assert(testTiles2['5,11'].building.type === 'barracks',
     '已 opened 的格子不应被修改')
+
+  // 6. TileSystem.open：25 金档 ? 兵营槽 — "空" 频率 45%-55%
+  const N2 = 1000
+  const emptyCount25 = { empty: 0 }
+  SeededRNG.init(2024)
+  for (let i = 0; i < N2; i++) {
+    const result = TileSystem.open({ icon: '?', price: 25 }, SeededRNG)
+    if (result.type === 'empty') emptyCount25.empty++
+  }
+  const emptyRate25 = emptyCount25.empty / N2
+  console.assert(emptyRate25 >= 0.45 && emptyRate25 <= 0.55,
+    `25 金档 ? 空率应在 45%-55%，实际 ${(emptyRate25 * 100).toFixed(1)}%`)
+
+  // 7. TileSystem.open：250 金档 ? 兵营槽 — 空 0%，紫+金 ≥ 95%
+  let empty250 = 0, rareOrGold250 = 0
+  SeededRNG.init(2025)
+  for (let i = 0; i < N2; i++) {
+    const result = TileSystem.open({ icon: '?', price: 250 }, SeededRNG)
+    if (result.type === 'empty') empty250++
+    if (result.type === 'barracks' && (result.tier === 'purple' || result.tier === 'gold')) rareOrGold250++
+  }
+  console.assert(empty250 === 0, `250 金档 ? 不应出空，实际 ${empty250}`)
+  console.assert(rareOrGold250 / N2 >= 0.95,
+    `250 金档 ? 紫+金应 ≥ 95%，实际 ${(rareOrGold250 / N2 * 100).toFixed(1)}%`)
+
+  // 8. TileSystem.open：25 金档头盔 — 永不空
+  let helmet25Empty = 0
+  SeededRNG.init(2026)
+  for (let i = 0; i < N2; i++) {
+    const result = TileSystem.open({ icon: 'helmet', price: 25 }, SeededRNG)
+    if (result.type === 'empty') helmet25Empty++
+  }
+  console.assert(helmet25Empty === 0, `25 金档头盔不应出空，实际 ${helmet25Empty}`)
+
+  // 9. TileSystem.open：盾牌 — 50 金档 / 100 金档 各 50%
+  let shield50 = 0, shield100 = 0
+  SeededRNG.init(2027)
+  for (let i = 0; i < N2; i++) {
+    const result = TileSystem.open({ icon: 'shield', price: 25 }, SeededRNG)
+    console.assert(result.type === 'archer_tower', `盾牌应出 archer_tower，实际 ${result.type}`)
+    if (result.priceTier === 50) shield50++
+    else if (result.priceTier === 100) shield100++
+  }
+  const shield50Rate = shield50 / N2
+  const shield100Rate = shield100 / N2
+  console.assert(shield50Rate >= 0.45 && shield50Rate <= 0.55,
+    `盾牌 50 金档应约 50%，实际 ${(shield50Rate * 100).toFixed(1)}%`)
+  console.assert(shield100Rate >= 0.45 && shield100Rate <= 0.55,
+    `盾牌 100 金档应约 50%，实际 ${(shield100Rate * 100).toFixed(1)}%`)
+
+  // 10. TileSystem.open：金属 — 100% 出金矿
+  let metalMine = 0
+  SeededRNG.init(2028)
+  for (let i = 0; i < N2; i++) {
+    const result = TileSystem.open({ icon: 'metal', price: 25 }, SeededRNG)
+    if (result.type === 'gold_mine') metalMine++
+  }
+  console.assert(metalMine === N2, `金属应 100% 出金矿，实际 ${metalMine}/${N2}`)
+
+  // 11. TileSystem.open：同 seed 同输入结果完全一致
+  SeededRNG.init(7777)
+  const r1 = TileSystem.open({ icon: '?', price: 50 }, SeededRNG)
+  SeededRNG.init(7777)
+  const r2 = TileSystem.open({ icon: '?', price: 50 }, SeededRNG)
+  console.assert(JSON.stringify(r1) === JSON.stringify(r2),
+    `同 seed 应一致: ${JSON.stringify(r1)} vs ${JSON.stringify(r2)}`)
 
   console.log('[test] TileSystem tests passed')
 })()
@@ -983,6 +1173,169 @@ gameLoop.start()
 
   console.log('[test] GameState determinism + integration tests passed')
 })()
+// ============================================================
+// ClickHandler tests: 状态机判定 + 经济 + 激活连锁
+// ============================================================
+;(function testClickHandler() {
+  // 辅助：构造最小可用的 tiles 状态
+  function freshTiles() {
+    const tiles = {}
+    for (let r = 0; r < HexGrid.ROWS; r++) {
+      for (let q = 0; q < HexGrid.COLS; q++) {
+        tiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+      }
+    }
+    return tiles
+  }
+
+  // 1. 点击 openable 格且金币充足 → 扣费 + 状态变 opened + 写入 building
+  ResourceSystem.init()
+  ResourceSystem.gold.player = 100
+  const t1 = freshTiles()
+  t1['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: 'metal', price: 25 }
+  SeededRNG.init(42)
+  const r1 = ClickHandler.handleTileClick(t1['4,10'], t1, 'player')
+  console.assert(r1.ok === true, `应成功开启，实际 ${JSON.stringify(r1)}`)
+  console.assert(ResourceSystem.gold.player === 75,
+    `扣费后应为 75，实际 ${ResourceSystem.gold.player}`)
+  console.assert(t1['4,10'].state === 'opened', '状态应变为 opened')
+  console.assert(t1['4,10'].building && t1['4,10'].building.type === 'gold_mine',
+    `金属应出 gold_mine，实际 ${JSON.stringify(t1['4,10'].building)}`)
+  console.assert(t1['4,10'].owner === 'player', 'owner 应保持 player')
+
+  // 2. 点击 openable 格但金币不足 → 不扣费、格子不变、返回通知
+  ResourceSystem.init()
+  ResourceSystem.gold.player = 10
+  const t2 = freshTiles()
+  t2['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: 'metal', price: 25 }
+  SeededRNG.init(42)
+  const r2 = ClickHandler.handleTileClick(t2['4,10'], t2, 'player')
+  console.assert(r2.ok === false, '金币不足应返回 ok=false')
+  console.assert(r2.reason === 'insufficient_gold', `reason 应为 insufficient_gold，实际 ${r2.reason}`)
+  console.assert(ResourceSystem.gold.player === 10, '金币不应变化')
+  console.assert(t2['4,10'].state === 'openable', '状态应保持 openable')
+
+  // 3. 点击 inactive 格 → 无反应
+  ResourceSystem.init()
+  ResourceSystem.gold.player = 100
+  const t3 = freshTiles()
+  const r3 = ClickHandler.handleTileClick(t3['0,0'], t3, 'player')
+  console.assert(r3.ok === false && r3.reason === 'not_openable',
+    `inactive 格应返回 not_openable，实际 ${JSON.stringify(r3)}`)
+  console.assert(ResourceSystem.gold.player === 100, 'inactive 格不应扣费')
+
+  // 4. 点击 opened 格 → 无反应（不可重复开）
+  ResourceSystem.init()
+  ResourceSystem.gold.player = 100
+  const t4 = freshTiles()
+  t4['4,10'] = { q: 4, r: 10, owner: 'player', state: 'opened', building: { type: 'gold_mine' } }
+  const r4 = ClickHandler.handleTileClick(t4['4,10'], t4, 'player')
+  console.assert(r4.ok === false && r4.reason === 'not_openable',
+    'opened 格应返回 not_openable')
+  console.assert(ResourceSystem.gold.player === 100, 'opened 格不应扣费')
+
+  // 5. 点击 null tile（未命中格子）→ 无反应
+  const r5 = ClickHandler.handleTileClick(null, {}, 'player')
+  console.assert(r5.ok === false && r5.reason === 'no_tile', 'null tile 应返回 no_tile')
+
+  // 6. 25 金档 ? 开空 → state 变 opened-empty（或 opened + building 为空）
+  ResourceSystem.init()
+  ResourceSystem.gold.player = 100
+  const t6 = freshTiles()
+  // 强制让 open 返回 empty：用一个确定会让 empty 被选中的 seed 进行多次尝试
+  t6['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: '?', price: 25 }
+  let foundEmpty = false
+  for (let seed = 0; seed < 200; seed++) {
+    SeededRNG.init(seed)
+    // 重置 tile
+    t6['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: '?', price: 25 }
+    ResourceSystem.gold.player = 100
+    const r = ClickHandler.handleTileClick(t6['4,10'], t6, 'player')
+    if (r.result && r.result.type === 'empty') {
+      console.assert(t6['4,10'].state === 'opened',
+        '空结果也应将状态设为 opened')
+      console.assert(t6['4,10'].building === null,
+        '空结果的 building 应为 null')
+      foundEmpty = true
+      break
+    }
+  }
+  console.assert(foundEmpty, '在 200 次尝试中应至少遇到一次空结果（25 金档 50% 空）')
+
+  // 7. 激活连锁：开出建筑后，其相邻 inactive 格应变为 openable
+  ResourceSystem.init()
+  ResourceSystem.gold.player = 1000
+  const t7 = freshTiles()
+  // 仅有一个孤立的 openable 格，周围全是 inactive；开启后邻居应被激活
+  t7['4,6'] = undefined // 湖水位置附近避免干扰
+  t7['4,5'] = { q: 4, r: 5, owner: 'player', state: 'openable', icon: 'metal', price: 25 }
+  // 把 (4,5) 周围的 inactive 格子先标 owner=null
+  const neighbors = HexGrid.getNeighbors(4, 5)
+  for (const n of neighbors) {
+    const key = `${n.q},${n.r}`
+    if (!t7[key]) t7[key] = { q: n.q, r: n.r, owner: null, state: 'inactive' }
+  }
+  SeededRNG.init(99)
+  const beforeOpenable = Object.values(t7).filter(t => t && t.state === 'openable').length
+  ClickHandler.handleTileClick(t7['4,5'], t7, 'player')
+  const afterOpenable = Object.values(t7).filter(t => t && t.state === 'openable').length
+  console.assert(afterOpenable >= beforeOpenable,
+    `开启后 openable 数量不应减少: ${beforeOpenable} → ${afterOpenable}`)
+  // 至少有一个新激活的格子（因为 (4,5) 的邻居里有 inactive 且与新 owner=player 的格相邻）
+  console.assert(afterOpenable > 0, '开启后应至少激活一个新 openable 格子')
+
+  // 8. 开金矿后立即计入 ResourceSystem.countMines（下一个 tick 就能产金）
+  ResourceSystem.init()
+  ResourceSystem.gold.player = 100
+  ResourceSystem.incomeTick = 0
+  const t8 = freshTiles()
+  t8['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: 'metal', price: 25 }
+  SeededRNG.init(42)
+  ClickHandler.handleTileClick(t8['4,10'], t8, 'player')
+  const mines = ResourceSystem.countMines(t8, 'player')
+  console.assert(mines === 1, `开出金矿后 countMines 应为 1，实际 ${mines}`)
+  // 跑 60 ticks 后金币应增加 12 (HQ) + 10 (金矿) = 22
+  for (let i = 0; i < 60; i++) ResourceSystem.tick(t8)
+  console.assert(ResourceSystem.gold.player === 97,
+    `开金矿后 6s 玩家金币应为 97（75+22），实际 ${ResourceSystem.gold.player}`)
+
+  // 9. 开盾牌：archer_tower 注册，priceTier 写入 building
+  ResourceSystem.init()
+  ResourceSystem.gold.player = 200
+  const t9 = freshTiles()
+  t9['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: 'shield', price: 50 }
+  SeededRNG.init(42)
+  const r9 = ClickHandler.handleTileClick(t9['4,10'], t9, 'player')
+  console.assert(r9.ok && t9['4,10'].building.type === 'archer_tower',
+    '盾牌应出 archer_tower')
+  console.assert(t9['4,10'].building.priceTier === 50 || t9['4,10'].building.priceTier === 100,
+    `盾牌 priceTier 应为 50 或 100，实际 ${t9['4,10'].building.priceTier}`)
+
+  // 10. 开?兵营槽：非空结果写入 barracks + tier
+  ResourceSystem.init()
+  ResourceSystem.gold.player = 1000
+  const t10 = freshTiles()
+  t10['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: '?', price: 100 }
+  let barracksCount = 0
+  for (let seed = 0; seed < 20; seed++) {
+    t10['4,10'] = { q: 4, r: 10, owner: 'player', state: 'openable', icon: '?', price: 100 }
+    ResourceSystem.gold.player = 1000
+    SeededRNG.init(seed + 1000)
+    const r = ClickHandler.handleTileClick(t10['4,10'], t10, 'player')
+    if (r.result && r.result.type === 'barracks') {
+      console.assert(t10['4,10'].building && t10['4,10'].building.type === 'barracks',
+        '非空 ? 结果应写入 barracks building')
+      console.assert(['green','blue','purple','gold'].includes(t10['4,10'].building.tier),
+        `barracks 应有有效 tier，实际 ${t10['4,10'].building.tier}`)
+      barracksCount++
+      if (barracksCount >= 3) break
+    }
+  }
+  console.assert(barracksCount >= 3, `应至少遇到 3 次非空 barracks，实际 ${barracksCount}`)
+
+  console.log('[test] ClickHandler tests passed')
+})()
+
 </script>
 </body>
 </html>
