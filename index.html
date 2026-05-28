@@ -34,6 +34,44 @@
     margin-top: 8px;
     cursor: pointer;
   }
+  #game-over-overlay {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0, 0, 0, 0.75);
+    justify-content: center;
+    align-items: center;
+    z-index: 100;
+  }
+  #game-over-overlay.visible {
+    display: flex;
+  }
+  #game-over-box {
+    background: #16213e;
+    border: 3px solid #0f3460;
+    border-radius: 12px;
+    padding: 32px 48px;
+    text-align: center;
+  }
+  #game-over-title {
+    font-size: 28px;
+    margin-bottom: 16px;
+  }
+  #game-over-title.win { color: #4caf50; }
+  #game-over-title.lose { color: #f44336; }
+  #restart-btn {
+    padding: 10px 24px;
+    font-size: 16px;
+    font-family: monospace;
+    background: #0f3460;
+    color: #eee;
+    border: 2px solid #2266cc;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  #restart-btn:hover {
+    background: #2266cc;
+  }
 </style>
 </head>
 <body>
@@ -43,6 +81,13 @@
   <div class="gold-display" id="ai-gold">AI: 0 金</div>
 </div>
 <canvas id="game-canvas" width="600" height="500"></canvas>
+
+<div id="game-over-overlay">
+  <div id="game-over-box">
+    <div id="game-over-title"></div>
+    <button id="restart-btn">重新开始</button>
+  </div>
+</div>
 
 <script>
 // ============================================================
@@ -265,7 +310,8 @@ function moveUnits(state) {
       unit.q = nextQ;
       unit.r = nextR;
     } else if (nextTile && nextTile.revealed && nextTile.owner !== unit.owner) {
-      // 移动到敌方/已有单位格子（暂不处理战斗，只移动）
+      // 移动到敌方格子：占领并改变归属
+      nextTile.owner = unit.owner;
       unit.tileKey = nextKey;
       unit.q = nextQ;
       unit.r = nextR;
@@ -274,6 +320,24 @@ function moveUnits(state) {
 
   // 清理死亡单位
   state.units = state.units.filter(u => u.currentHp > 0);
+}
+
+// ============================================================
+// Victory/defeat detection
+// ============================================================
+function checkVictory(state) {
+  for (const unit of state.units) {
+    if (unit.currentHp <= 0) continue;
+    // 玩家单位占领 AI 大本营 → 玩家胜利
+    if (unit.owner === 'player' && unit.tileKey === state.aiBase) {
+      return 'player_win';
+    }
+    // AI 单位占领玩家大本营 → AI 胜利
+    if (unit.owner === 'ai' && unit.tileKey === state.playerBase) {
+      return 'ai_win';
+    }
+  }
+  return null;
 }
 
 // ============================================================
@@ -404,6 +468,13 @@ const MAP_SEED = 42;
 
 function initGameState() {
   const map = TileReveal.generateMap(MAP_COLS, MAP_ROWS, MAP_SEED);
+
+  // 双方大本营初始各有一个兵营（公平开局）
+  map.tiles[map.playerBase].building = 'barracks';
+  map.tiles[map.playerBase].spawnTimer = 0;
+  map.tiles[map.aiBase].building = 'barracks';
+  map.tiles[map.aiBase].spawnTimer = 0;
+
   return {
     playerResources: ResourceSystem.create(50),
     aiResources: ResourceSystem.create(50),
@@ -414,6 +485,41 @@ function initGameState() {
 }
 
 let gameState = initGameState();
+let isGameOver = false;
+
+// 显示游戏结束覆盖层
+function showGameOver(result) {
+  isGameOver = true;
+  gameLoop.stop();
+  const overlay = document.getElementById('game-over-overlay');
+  const title = document.getElementById('game-over-title');
+  if (result === 'player_win') {
+    title.textContent = '胜利！';
+    title.className = 'win';
+  } else {
+    title.textContent = '失败！';
+    title.className = 'lose';
+  }
+  overlay.classList.add('visible');
+}
+
+// 重新开始游戏
+function restartGame() {
+  const overlay = document.getElementById('game-over-overlay');
+  overlay.classList.remove('visible');
+  gameState = initGameState();
+  isGameOver = false;
+  tickCount = 0;
+  AIBehavior.revealTimer = 0;
+  AIBehavior.buildCheckTimer = 0;
+  notificationText = '';
+  notificationTimer = 0;
+  updateUI();
+  render();
+  gameLoop.start();
+}
+
+document.getElementById('restart-btn').addEventListener('click', restartGame);
 
 // ============================================================
 // UI update
@@ -550,6 +656,7 @@ function render() {
 // Click handling: reveal tiles on click
 // ============================================================
 canvas.addEventListener('click', (event) => {
+  if (isGameOver) return; // 游戏结束后禁止操作
   const rect = canvas.getBoundingClientRect();
   const mx = event.clientX - rect.left;
   const my = event.clientY - rect.top;
@@ -668,6 +775,9 @@ const gameLoop = createGameLoop(() => {
     gameState.units = (gameState.units || []).concat(playerUnits, aiUnits);
   }
 
+  // AI 行为树 tick
+  AIBehavior.tick(gameState);
+
   // 单位移动：每 1Hz 移动一次（向敌方大本营方向）
   if (tickCount % 10 === 0) {
     moveUnits(gameState);
@@ -676,6 +786,13 @@ const gameLoop = createGameLoop(() => {
   // 战斗：每 1Hz 检测相邻敌对单位并交战
   if (tickCount % 10 === 0) {
     combatTick(gameState);
+  }
+
+  // 胜负判定
+  const victoryResult = checkVictory(gameState);
+  if (victoryResult !== null) {
+    showGameOver(victoryResult);
+    return; // 停止本轮后续更新
   }
 
   render();
@@ -752,6 +869,88 @@ const BarracksSystem = {
   randomUnitType() {
     const types = Object.keys(UNIT_TYPES);
     return types[Math.floor(Math.random() * types.length)];
+  }
+};
+
+// ============================================================
+// AIBehavior: AI 决策逻辑（翻牌、建兵营）
+// ============================================================
+const AIBehavior = {
+  REVEAL_INTERVAL: 2000,  // 每 2 秒翻牌
+  BUILD_CHECK_INTERVAL: 5000, // 每 5 秒检查建兵营
+  FRONTLINE_THRESHOLD: 3, // 前线兵力 < 3 时建兵营
+
+  // 内部计时状态
+  revealTimer: 0,
+  buildCheckTimer: 0,
+
+  // 主 tick：每 100ms 调用，推进计时器并执行决策
+  tick(state, dt = 100) {
+    this.revealTimer += dt;
+    this.buildCheckTimer += dt;
+
+    if (this.revealTimer >= this.REVEAL_INTERVAL) {
+      this.revealTimer = 0;
+      this.tryRevealNearest(state);
+    }
+
+    if (this.buildCheckTimer >= this.BUILD_CHECK_INTERVAL) {
+      this.buildCheckTimer = 0;
+      this.tryBuildBarracks(state);
+    }
+  },
+
+  // AI 翻牌：找离 AI 基地最近的未翻开格子
+  tryRevealNearest(state) {
+    if (state.aiResources.gold < ResourceSystem.REVEAL_COST) return;
+
+    const [baseQ, baseR] = state.aiBase.split(',').map(Number);
+    let nearestKey = null;
+    let nearestDist = Infinity;
+
+    for (const key of Object.keys(state.tiles)) {
+      const tile = state.tiles[key];
+      if (tile.revealed) continue;
+
+      // 曼哈顿距离（axial 坐标）
+      const dist = Math.abs(tile.q - baseQ) + Math.abs(tile.r - baseR);
+      if (dist < nearestDist) {
+        nearestDist = dist;
+        nearestKey = key;
+      }
+    }
+
+    if (!nearestKey) return;
+
+    const revealResult = ResourceSystem.tryReveal(state.aiResources);
+    if (!revealResult.success) return;
+
+    const result = TileReveal.reveal(nearestKey, state.tiles);
+    if (result.success && result.tileType === 'mine') {
+      ResourceSystem.onMineRevealed(state.aiResources);
+    }
+  },
+
+  // AI 建兵营：前线兵力 < 3 时在己方空地建
+  tryBuildBarracks(state) {
+    if (state.aiResources.gold < BarracksSystem.BUILD_COST) return;
+
+    const frontlineCount = this.countFrontlineUnits(state, 'ai');
+    if (frontlineCount >= this.FRONTLINE_THRESHOLD) return;
+
+    // 找一个己方空地且无兵营的格子
+    for (const key of Object.keys(state.tiles)) {
+      const tile = state.tiles[key];
+      if (tile.revealed && tile.type === 'empty' && tile.owner === 'ai' && tile.building !== 'barracks') {
+        BarracksSystem.tryBuild(state.aiResources, tile, key, state.tiles, 'ai');
+        return;
+      }
+    }
+  },
+
+  // 统计前线单位数量（己方单位在已占领格子上的数量）
+  countFrontlineUnits(state, owner) {
+    return state.units.filter(u => u.owner === owner && u.currentHp > 0).length;
   }
 };
 
@@ -873,6 +1072,101 @@ const BarracksSystem = {
 })();
 
 // ============================================================
+// Embedded assertions: AIBehavior reveal and build logic
+// ============================================================
+(function testAIBehavior() {
+  // --- 测试 1: AI 翻牌最近未翻开格子 ---
+  const aiState1 = {
+    aiBase: '2,6',
+    aiResources: ResourceSystem.create(50),
+    tiles: {
+      '2,6': { q: 2, r: 6, type: 'base', owner: 'ai', revealed: true },
+      '0,0': { q: 0, r: 0, type: 'mine', owner: 'neutral', revealed: false },
+      '1,5': { q: 1, r: 5, type: 'empty', owner: 'neutral', revealed: false },
+      '3,5': { q: 3, r: 5, type: 'monster', owner: 'neutral', revealed: false }
+    },
+    units: []
+  };
+
+  // 重置 AI 计时器
+  AIBehavior.revealTimer = 0;
+  AIBehavior.buildCheckTimer = 0;
+
+  // 推进 2 秒，触发翻牌
+  AIBehavior.tick(aiState1, 2000);
+  // (1,5) 距离 AI 基地 (2,6) 最近（曼哈顿距离 2），应该被翻牌
+  console.assert(aiState1.tiles['1,5'].revealed === true, 'AI should reveal nearest fog tile');
+  console.assert(aiState1.aiResources.gold === 40, `AI gold should be 40 after reveal (50-10), got ${aiState1.aiResources.gold}`);
+
+  // --- 测试 2: AI 金币不足时不翻牌 ---
+  const aiState2 = {
+    aiBase: '2,6',
+    aiResources: ResourceSystem.create(5),
+    tiles: {
+      '2,6': { q: 2, r: 6, type: 'base', owner: 'ai', revealed: true },
+      '1,5': { q: 1, r: 5, type: 'empty', owner: 'neutral', revealed: false }
+    },
+    units: []
+  };
+  AIBehavior.revealTimer = 0;
+  AIBehavior.tick(aiState2, 2000);
+  console.assert(aiState2.tiles['1,5'].revealed === false, 'AI should not reveal when gold < 10');
+  console.assert(aiState2.aiResources.gold === 5, 'AI gold should not change');
+
+  // --- 测试 3: AI 建兵营（前线兵力 < 3） ---
+  const aiState3 = {
+    aiBase: '2,6',
+    aiResources: ResourceSystem.create(50),
+    tiles: {
+      '2,6': { q: 2, r: 6, type: 'base', owner: 'ai', revealed: true },
+      '1,6': { q: 1, r: 6, type: 'empty', owner: 'ai', revealed: true, building: undefined }
+    },
+    units: []
+  };
+  AIBehavior.revealTimer = 0;
+  AIBehavior.buildCheckTimer = 0;
+
+  // 推进 5 秒，触发建兵营检查
+  AIBehavior.tick(aiState3, 5000);
+  // 前线 0 兵力 < 3，应该建兵营
+  console.assert(aiState3.aiResources.gold === 10, `AI gold should be 10 after build (50-40), got ${aiState3.aiResources.gold}`);
+  console.assert(aiState3.tiles['1,6'].building === 'barracks', 'AI should build barracks on empty tile');
+
+  // --- 测试 4: AI 前线兵力 >= 3 时不建兵营 ---
+  const aiState4 = {
+    aiBase: '2,6',
+    aiResources: ResourceSystem.create(50),
+    tiles: {
+      '2,6': { q: 2, r: 6, type: 'base', owner: 'ai', revealed: true },
+      '1,6': { q: 1, r: 6, type: 'empty', owner: 'ai', revealed: true, building: undefined }
+    },
+    units: [
+      { type: 'infantry', hp: 220, atk: 15, currentHp: 220, owner: 'ai', tileKey: '2,6', q: 2, r: 6 },
+      { type: 'cavalry', hp: 180, atk: 18, currentHp: 180, owner: 'ai', tileKey: '2,6', q: 2, r: 6 },
+      { type: 'archer', hp: 120, atk: 20, currentHp: 120, owner: 'ai', tileKey: '2,6', q: 2, r: 6 }
+    ]
+  };
+  AIBehavior.revealTimer = 0;
+  AIBehavior.buildCheckTimer = 0;
+  AIBehavior.tick(aiState4, 5000);
+  console.assert(aiState4.aiResources.gold === 50, 'AI should not build barracks when frontline >= 3');
+  console.assert(aiState4.tiles['1,6'].building !== 'barracks', 'No barracks should be built');
+
+  // --- 测试 5: countFrontlineUnits 正确统计 ---
+  const countState = {
+    units: [
+      { type: 'infantry', hp: 220, currentHp: 220, owner: 'ai' },
+      { type: 'cavalry', hp: 180, currentHp: 0, owner: 'ai' }, // 死亡
+      { type: 'archer', hp: 120, currentHp: 120, owner: 'player' }
+    ]
+  };
+  console.assert(AIBehavior.countFrontlineUnits(countState, 'ai') === 1, 'Should count only alive AI units');
+  console.assert(AIBehavior.countFrontlineUnits(countState, 'player') === 1, 'Should count player units');
+
+  console.log('[test] AIBehavior tests passed');
+})();
+
+// ============================================================
 // Embedded assertions: Unit movement and tile claiming
 // ============================================================
 (function testUnitMovement() {
@@ -911,6 +1205,23 @@ const BarracksSystem = {
   moveUnits(state);
   const aliveUnits = state.units.filter(u => u.currentHp > 0);
   console.assert(state.units.length === aliveUnits.length, 'Dead units should be removed after moveUnits');
+
+  // 测试占领敌方格子：玩家单位移动到 AI 拥有的格子
+  const enemyState = {
+    tiles: {
+      '0,0': { q: 0, r: 0, type: 'base', owner: 'player', revealed: true },
+      '1,0': { q: 1, r: 0, type: 'empty', owner: 'ai', revealed: true }
+    },
+    units: [
+      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '0,0', q: 0, r: 0 }
+    ],
+    aiBase: '1,0',
+    playerBase: '0,0'
+  };
+  moveUnits(enemyState);
+  console.assert(enemyState.units[0].tileKey === '1,0', 'Player unit should move onto AI base tile');
+  console.assert(enemyState.tiles['1,0'].owner === 'player', 'AI base tile should be claimed by player after unit enters');
+  console.assert(enemyState.units[0].tileKey === enemyState.aiBase, 'Unit tileKey should match aiBase key');
 
   console.log('[test] Unit movement tests passed');
 })();
@@ -993,6 +1304,48 @@ const BarracksSystem = {
   console.assert(state3.units[1].currentHp === 180, 'Same-faction units should not fight');
 
   console.log('[test] Combat damage tests passed');
+})();
+
+// ============================================================
+// Embedded assertions: Victory/defeat detection
+// ============================================================
+(function testCheckVictory() {
+  // 玩家单位在 AI 大本营 → 玩家胜利
+  const stateWin = {
+    playerBase: '2,0',
+    aiBase: '2,6',
+    units: [
+      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '2,6', q: 2, r: 6 }
+    ]
+  };
+  console.assert(checkVictory(stateWin) === 'player_win', 'Player unit on AI base should be player_win');
+
+  // AI 单位在玩家大本营 → 玩家失败
+  const stateLose = {
+    playerBase: '2,0',
+    aiBase: '2,6',
+    units: [
+      { type: 'cavalry', name: '骑兵', hp: 180, atk: 18, currentHp: 180, owner: 'ai', tileKey: '2,0', q: 2, r: 0 }
+    ]
+  };
+  console.assert(checkVictory(stateLose) === 'ai_win', 'AI unit on player base should be ai_win');
+
+  // 双方都不在对方大本营 → 无结果
+  const stateOngoing = {
+    playerBase: '2,0',
+    aiBase: '2,6',
+    units: [
+      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '1,0', q: 1, r: 0 },
+      { type: 'cavalry', name: '骑兵', hp: 180, atk: 18, currentHp: 180, owner: 'ai', tileKey: '1,6', q: 1, r: 6 }
+    ]
+  };
+  console.assert(checkVictory(stateOngoing) === null, 'No unit on enemy base should be null');
+
+  // 空单位列表 → 无结果
+  const stateEmpty = { playerBase: '2,0', aiBase: '2,6', units: [] };
+  console.assert(checkVictory(stateEmpty) === null, 'Empty units should be null');
+
+  console.log('[test] CheckVictory tests passed');
 })();
 
 // ============================================================
