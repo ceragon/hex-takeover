@@ -30,6 +30,7 @@
 <div id="ui-bar" style="margin-top:8px;font-size:14px;display:flex;gap:32px;">
   <span id="player-gold" style="color:#6af;">己方金币: 60</span>
   <span id="ai-gold" style="color:#f66;">敌方金币: 60</span>
+  <span id="territory-count" style="color:#aaa;">占领: 0/108</span>
 </div>
 
 <script>
@@ -138,17 +139,18 @@ const HexGrid = {
     return { q, r }
   },
 
-  // 返回 (q, r) 的 6 个邻居，过滤掉越界与湖水格；输入若为湖水或越界则返回 []
+  // 返回 (q, r) 的 6 个邻居，过滤掉越界格；输入若越界返回 []
+  // 湖水格 (r=LAKE_ROW) 是视觉装饰，不作为移动屏障，正常参与邻居计算
   getNeighbors(q, r) {
-    if (!this.isInBounds(q, r) || this.isLake(q, r)) return []
+    if (!this.isInBounds(q, r)) return []
     const offsets = (r % 2 === 0)
-      ? [[1, 0], [-1, 0], [1, -1], [0, -1], [1, 1], [0, 1]]
-      : [[1, 0], [-1, 0], [0, -1], [-1, -1], [0, 1], [-1, 1]]
+      ? [[1, 0], [-1, 0], [0, -1], [-1, -1], [1, 1], [0, 1]]
+      : [[1, 0], [-1, 0], [1, -1], [0, -1], [0, 1], [-1, 1]]
     const result = []
     for (const [dq, dr] of offsets) {
       const nq = q + dq
       const nr = r + dr
-      if (this.isInBounds(nq, nr) && !this.isLake(nq, nr)) {
+      if (this.isInBounds(nq, nr)) {
         result.push({ q: nq, r: nr })
       }
     }
@@ -478,13 +480,207 @@ const BarracksSystem = {
           atk: unitDef.atk,
           speed: unitDef.speed,
           range: unitDef.range,
-          trait: unitDef.trait
+          trait: unitDef.trait,
+          moveProgress: 0
         }
         this.units.push(unit)
         spawned.push(unit)
       }
     }
     return spawned
+  }
+}
+
+// ============================================================
+// TerritorySystem: 领地归属跟踪 + 推线变色 + 激活连锁
+// ============================================================
+const TerritorySystem = {
+  owners: {},
+  total: HexGrid.COLS * HexGrid.ROWS - HexGrid.COLS,
+
+  init() {
+    this.owners = {}
+  },
+
+  claim(hexId, owner, tiles, rng) {
+    this.owners[hexId] = owner
+    if (tiles && rng) {
+      TileSystem.activateOpenableTiles(tiles, rng)
+    }
+  },
+
+  count(owner) {
+    let c = 0
+    for (const h of Object.keys(this.owners)) {
+      if (this.owners[h] === owner) c++
+    }
+    return c
+  }
+}
+
+// ============================================================
+// MoveUnits: BFS 寻路 + 品阶差异化寻敌 + 移动进度累加 + 推线领地声明
+// ============================================================
+const MoveUnits = {
+  computeBFS(start, target, tiles) {
+    if (start.q === target.q && start.r === target.r) return []
+
+    const queue = [{ q: start.q, r: start.r }]
+    const visited = new Set([`${start.q},${start.r}`])
+    const parent = {}
+
+    while (queue.length > 0) {
+      const current = queue.shift()
+      const currentId = `${current.q},${current.r}`
+
+      if (current.q === target.q && current.r === target.r) {
+        const path = []
+        let id = currentId
+        while (parent[id]) {
+          const [q, r] = id.split(',').map(Number)
+          path.unshift({ q, r })
+          id = parent[id]
+        }
+        return path
+      }
+
+      const neighbors = HexGrid.getNeighbors(current.q, current.r)
+      for (const n of neighbors) {
+        const nId = `${n.q},${n.r}`
+        if (visited.has(nId)) continue
+        visited.add(nId)
+        parent[nId] = currentId
+        if (n.q === target.q && n.r === target.r) {
+          const path = []
+          let id = nId
+          while (parent[id]) {
+            const [q, r] = id.split(',').map(Number)
+            path.unshift({ q, r })
+            id = parent[id]
+          }
+          return path
+        }
+        queue.push(n)
+      }
+    }
+
+    return null
+  },
+
+  selectTarget(unit, allUnits, tiles) {
+    const enemy = unit.owner === 'player' ? 'ai' : 'player'
+    const [sq, sr] = unit.hexId.split(',').map(Number)
+    const tier = unit.tier
+
+    if (tier === 'purple') {
+      return this._findNearestBuilding(sq, sr, enemy, tiles)
+    }
+
+    if (tier === 'gold') {
+      const unitTarget = this._findNearestEnemyUnit(sq, sr, unit, allUnits)
+      if (unitTarget) return unitTarget
+      return this._findNearestBuilding(sq, sr, enemy, tiles)
+    }
+
+    return this._findNearestEnemy(sq, sr, unit, allUnits, enemy, tiles)
+  },
+
+  _findNearestEnemy(sq, sr, selfUnit, allUnits, enemy, tiles) {
+    const queue = [{ q: sq, r: sr, dist: 0 }]
+    const visited = new Set([`${sq},${sr}`])
+
+    while (queue.length > 0) {
+      const { q, r, dist } = queue.shift()
+      if (dist > 0) {
+        const hexId = `${q},${r}`
+        const eu = allUnits.find(u => u !== selfUnit && u.owner === enemy && u.hexId === hexId)
+        if (eu) return { type: 'unit', hexId, q, r }
+        const tile = tiles[hexId]
+        if (tile && tile.owner === enemy && tile.building) {
+          return { type: 'building', hexId, q, r }
+        }
+      }
+      const neighbors = HexGrid.getNeighbors(q, r)
+      for (const n of neighbors) {
+        const nId = `${n.q},${n.r}`
+        if (visited.has(nId)) continue
+        visited.add(nId)
+        queue.push({ q: n.q, r: n.r, dist: dist + 1 })
+      }
+    }
+    return null
+  },
+
+  _findNearestEnemyUnit(sq, sr, selfUnit, allUnits) {
+    const queue = [{ q: sq, r: sr, dist: 0 }]
+    const visited = new Set([`${sq},${sr}`])
+
+    while (queue.length > 0) {
+      const { q, r, dist } = queue.shift()
+      if (dist > 0) {
+        const hexId = `${q},${r}`
+        const eu = allUnits.find(u => u !== selfUnit && u.owner !== selfUnit.owner && u.hexId === hexId)
+        if (eu) return { type: 'unit', hexId, q, r }
+      }
+      const neighbors = HexGrid.getNeighbors(q, r)
+      for (const n of neighbors) {
+        const nId = `${n.q},${n.r}`
+        if (visited.has(nId)) continue
+        visited.add(nId)
+        queue.push({ q: n.q, r: n.r, dist: dist + 1 })
+      }
+    }
+    return null
+  },
+
+  _findNearestBuilding(sq, sr, enemy, tiles) {
+    const queue = [{ q: sq, r: sr, dist: 0 }]
+    const visited = new Set([`${sq},${sr}`])
+
+    while (queue.length > 0) {
+      const { q, r, dist } = queue.shift()
+      if (dist > 0) {
+        const hexId = `${q},${r}`
+        const tile = tiles[hexId]
+        if (tile && tile.owner === enemy && tile.building) {
+          return { type: 'building', hexId, q, r }
+        }
+      }
+      const neighbors = HexGrid.getNeighbors(q, r)
+      for (const n of neighbors) {
+        const nId = `${n.q},${n.r}`
+        if (visited.has(nId)) continue
+        visited.add(nId)
+        queue.push({ q: n.q, r: n.r, dist: dist + 1 })
+      }
+    }
+    return null
+  },
+
+  tick(units, tiles) {
+    for (const unit of units) {
+      const target = this.selectTarget(unit, units, tiles)
+      if (!target) continue
+
+      const [cq, cr] = unit.hexId.split(',').map(Number)
+      const path = this.computeBFS({ q: cq, r: cr }, { q: target.q, r: target.r }, tiles)
+      if (!path || path.length === 0) continue
+
+      if (unit.moveProgress === undefined) unit.moveProgress = 0
+      unit.moveProgress += unit.speed / 10
+
+      if (unit.moveProgress >= 1) {
+        unit.moveProgress -= 1
+        const next = path[0]
+        unit.prevHexId = unit.hexId
+        unit.hexId = `${next.q},${next.r}`
+
+        const tile = tiles[unit.hexId]
+        if (tile && tile.owner && tile.owner !== unit.owner) {
+          TerritorySystem.claim(unit.hexId, unit.owner, tiles, SeededRNG)
+        }
+      }
+    }
   }
 }
 
@@ -577,6 +773,7 @@ function initGameState() {
 
   ResourceSystem.init()
   BarracksSystem.init()
+  TerritorySystem.init()
 
   for (const hexId of Object.keys(tiles)) {
     const tile = tiles[hexId]
@@ -706,9 +903,26 @@ function renderUnits() {
   for (const unit of units) {
     const tile = gameState.tiles[unit.hexId]
     if (!tile) continue
-    const { x, y } = HexGrid.axialToPixel(tile.q, tile.r)
-    const cx = x + RENDER_OFFSET.x
-    const cy = y + RENDER_OFFSET.y
+
+    let cx, cy
+    if (unit.prevHexId && unit.moveProgress !== undefined && unit.moveProgress > 0) {
+      const prevTile = gameState.tiles[unit.prevHexId]
+      if (prevTile) {
+        const from = HexGrid.axialToPixel(prevTile.q, prevTile.r)
+        const to = HexGrid.axialToPixel(tile.q, tile.r)
+        const t = unit.moveProgress
+        cx = from.x + RENDER_OFFSET.x + (to.x - from.x) * t
+        cy = from.y + RENDER_OFFSET.y + (to.y - from.y) * t
+      } else {
+        const pos = HexGrid.axialToPixel(tile.q, tile.r)
+        cx = pos.x + RENDER_OFFSET.x
+        cy = pos.y + RENDER_OFFSET.y
+      }
+    } else {
+      const pos = HexGrid.axialToPixel(tile.q, tile.r)
+      cx = pos.x + RENDER_OFFSET.x
+      cy = pos.y + RENDER_OFFSET.y
+    }
 
     const sameHexUnits = units.filter(u => u.hexId === unit.hexId && u.owner === unit.owner)
     const idx = sameHexUnits.indexOf(unit)
@@ -731,8 +945,10 @@ function renderUnits() {
 function updateUI() {
   const pg = document.getElementById('player-gold')
   const ag = document.getElementById('ai-gold')
+  const tc = document.getElementById('territory-count')
   if (pg) pg.textContent = `己方金币: ${ResourceSystem.gold.player}`
   if (ag) ag.textContent = `敌方金币: ${ResourceSystem.gold.ai}`
+  if (tc) tc.textContent = `占领: ${TerritorySystem.count('player')}/${TerritorySystem.total}`
 }
 
 function render() {
@@ -766,6 +982,7 @@ const gameLoop = createGameLoop(() => {
   tickCount++
   ResourceSystem.tick(gameState.tiles)
   BarracksSystem.tick(gameState.tiles, SeededRNG)
+  MoveUnits.tick(BarracksSystem.units, gameState.tiles)
   render()
 })
 
@@ -808,22 +1025,21 @@ gameLoop.start()
   console.assert(corner.every(n => HexGrid.isInBounds(n.q, n.r)), '角落邻居不应越界')
 
   const edge = HexGrid.getNeighbors(0, 3)
-  console.assert(edge.length === 3, `左边缘 (0,3) 应有 3 个邻居，实际 ${edge.length}`)
+  console.assert(edge.length === 4, `左边缘 (0,3) 应有 4 个邻居，实际 ${edge.length}`)
 
   const mid = HexGrid.getNeighbors(4, 3)
   console.assert(mid.length === 6, `中央 (4,3) 应有 6 个邻居，实际 ${mid.length}`)
 
   const nearLakeEven = HexGrid.getNeighbors(4, 5)
-  console.assert(nearLakeEven.length === 4,
-    `湖前偶数行 (4,5) 应有 4 个邻居，实际 ${nearLakeEven.length}`)
-  console.assert(nearLakeEven.every(n => !HexGrid.isLake(n.q, n.r)), '湖前邻居不应含湖水')
+  console.assert(nearLakeEven.length === 6,
+    `湖前 (4,5) 应有 6 个邻居（含湖水格），实际 ${nearLakeEven.length}`)
 
   const nearLakeOdd = HexGrid.getNeighbors(4, 7)
-  console.assert(nearLakeOdd.length === 4,
-    `湖后奇数行 (4,7) 应有 4 个邻居，实际 ${nearLakeOdd.length}`)
+  console.assert(nearLakeOdd.length === 6,
+    `湖后 (4,7) 应有 6 个邻居（含湖水格），实际 ${nearLakeOdd.length}`)
 
   const lakeNeighbors = HexGrid.getNeighbors(4, 6)
-  console.assert(lakeNeighbors.length === 0, `湖水格 (4,6) 应返回 0 个邻居，实际 ${lakeNeighbors.length}`)
+  console.assert(lakeNeighbors.length === 6, `湖水格 (4,6) 应有 6 个邻居（可通行），实际 ${lakeNeighbors.length}`)
 
   const cornerTopRight = HexGrid.getNeighbors(8, 0)
   console.assert(cornerTopRight.every(n => n.q <= 8 && n.r >= 0),
@@ -1646,6 +1862,208 @@ gameLoop.start()
   console.assert(barracksCount >= 3, `应至少遇到 3 次非空 barracks，实际 ${barracksCount}`)
 
   console.log('[test] ClickHandler tests passed')
+})()
+
+// ============================================================
+// TerritorySystem tests: claim, count, cascade activation
+// ============================================================
+;(function testTerritorySystem() {
+  // 1. init resets owners
+  TerritorySystem.init()
+  console.assert(Object.keys(TerritorySystem.owners).length === 0,
+    'init should reset owners')
+
+  // 2. claim sets owner
+  TerritorySystem.init()
+  TerritorySystem.claim('4,5', 'player', {}, SeededRNG)
+  console.assert(TerritorySystem.owners['4,5'] === 'player',
+    'claim should set owner to player')
+
+  // 3. claim overrides previous owner
+  TerritorySystem.claim('4,5', 'ai', {}, SeededRNG)
+  console.assert(TerritorySystem.owners['4,5'] === 'ai',
+    'claim should override previous owner')
+
+  // 4. count counts correctly
+  TerritorySystem.init()
+  TerritorySystem.claim('4,5', 'player', {}, SeededRNG)
+  TerritorySystem.claim('3,5', 'player', {}, SeededRNG)
+  TerritorySystem.claim('4,4', 'ai', {}, SeededRNG)
+  console.assert(TerritorySystem.count('player') === 2,
+    `player count should be 2, got ${TerritorySystem.count('player')}`)
+  console.assert(TerritorySystem.count('ai') === 1,
+    `ai count should be 1, got ${TerritorySystem.count('ai')}`)
+
+  // 5. total is non-lake tiles
+  console.assert(TerritorySystem.total === HexGrid.COLS * HexGrid.ROWS - HexGrid.COLS,
+    `total should be ${HexGrid.COLS * HexGrid.ROWS - HexGrid.COLS}, got ${TerritorySystem.total}`)
+
+  // 6. cascade: claiming near owned tile activates inactive neighbors
+  TerritorySystem.init()
+  SeededRNG.init(42)
+  const tiles = {}
+  for (let r = 0; r < HexGrid.ROWS; r++) {
+    for (let q = 0; q < HexGrid.COLS; q++) {
+      tiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+    }
+  }
+  tiles['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened', building: { type: 'hq' } }
+  tiles['4,7'] = { q: 4, r: 7, owner: 'ai', state: 'opened', building: { type: 'hq' } }
+  const beforeCount = Object.values(tiles).filter(t => t && t.state === 'openable').length
+  TerritorySystem.claim('4,4', 'player', tiles, SeededRNG)
+  const afterCount = Object.values(tiles).filter(t => t && t.state === 'openable').length
+  console.assert(afterCount > beforeCount,
+    `cascade should activate new tiles: ${beforeCount} → ${afterCount}`)
+
+  console.log('[test] TerritorySystem tests passed')
+})()
+
+// ============================================================
+// MoveUnits tests: BFS pathfinding + target selection + movement
+// ============================================================
+;(function testMoveUnits() {
+  function freshTiles() {
+    const tiles = {}
+    for (let r = 0; r < HexGrid.ROWS; r++) {
+      for (let q = 0; q < HexGrid.COLS; q++) {
+        tiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+      }
+    }
+    return tiles
+  }
+
+  // === BFS Pathfinding ===
+
+  // 1. Adjacent hex: path has 1 element (the target)
+  const tiles = freshTiles()
+  const path1 = MoveUnits.computeBFS({ q: 4, r: 5 }, { q: 4, r: 4 }, tiles)
+  console.assert(Array.isArray(path1) && path1.length === 1,
+    `BFS to adjacent hex should return path of length 1, got ${JSON.stringify(path1)}`)
+
+  // 2. Multi-step path
+  const path2 = MoveUnits.computeBFS({ q: 4, r: 5 }, { q: 4, r: 3 }, tiles)
+  console.assert(path2.length === 2,
+    `BFS 2 steps away should give path of length 2, got ${path2.length}`)
+
+  // 3. Path crosses lake (lake is passable, visual-only)
+  const path3 = MoveUnits.computeBFS({ q: 4, r: 5 }, { q: 4, r: 7 }, tiles)
+  console.assert(path3.length === 2,
+    `BFS across lake should go direct (2 steps), got ${path3.length}`)
+
+  // 4. Path to lake hex (passable, visual-only)
+  const path4 = MoveUnits.computeBFS({ q: 4, r: 5 }, { q: 4, r: 6 }, tiles)
+  console.assert(path4 && path4.length === 1,
+    `BFS to lake hex should return path of length 1, got ${JSON.stringify(path4)}`)
+
+  // === Target Selection ===
+
+  // 5. Green/blue: nearest enemy (unit preferred when closer)
+  const t5 = freshTiles()
+  BarracksSystem.init()
+  BarracksSystem.units = [
+    { key: 'skeleton', tier: 'green', owner: 'player', hexId: '4,3', moveProgress: 0 },
+    { key: 'wolf', tier: 'green', owner: 'ai', hexId: '3,2' },
+  ]
+  t5['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened', building: { type: 'hq' } }
+  const target5 = MoveUnits.selectTarget(BarracksSystem.units[0], BarracksSystem.units, t5)
+  console.assert(target5 && target5.type === 'unit',
+    `green should target nearest enemy unit, got ${JSON.stringify(target5)}`)
+
+  // 6. Purple: targets building, ignores enemy units
+  const t6 = freshTiles()
+  BarracksSystem.init()
+  BarracksSystem.units = [
+    { key: 'cavalry', tier: 'purple', owner: 'player', hexId: '4,3', moveProgress: 0 },
+    { key: 'wolf', tier: 'green', owner: 'ai', hexId: '3,2' },
+  ]
+  t6['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened', building: { type: 'hq' } }
+  const target6 = MoveUnits.selectTarget(BarracksSystem.units[0], BarracksSystem.units, t6)
+  console.assert(target6 && target6.type === 'building',
+    `purple should target building not unit, got ${JSON.stringify(target6)}`)
+
+  // 7. Gold: prioritize enemy units over buildings
+  const t7 = freshTiles()
+  BarracksSystem.init()
+  BarracksSystem.units = [
+    { key: 'dragon', tier: 'gold', owner: 'player', hexId: '4,3', moveProgress: 0 },
+    { key: 'wolf', tier: 'green', owner: 'ai', hexId: '3,2' },
+  ]
+  t7['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened', building: { type: 'hq' } }
+  const target7 = MoveUnits.selectTarget(BarracksSystem.units[0], BarracksSystem.units, t7)
+  console.assert(target7 && target7.type === 'unit',
+    `gold should prioritize enemy unit, got ${JSON.stringify(target7)}`)
+
+  // 8. Gold: fall back to building when no enemy units
+  const t8 = freshTiles()
+  BarracksSystem.init()
+  BarracksSystem.units = [
+    { key: 'dragon', tier: 'gold', owner: 'player', hexId: '4,3', moveProgress: 0 },
+  ]
+  t8['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened', building: { type: 'hq' } }
+  const target8 = MoveUnits.selectTarget(BarracksSystem.units[0], BarracksSystem.units, t8)
+  console.assert(target8 && target8.type === 'building',
+    `gold should target building when no enemy units, got ${JSON.stringify(target8)}`)
+
+  // 9. No target when no enemies
+  const t9 = freshTiles()
+  BarracksSystem.init()
+  BarracksSystem.units = [
+    { key: 'skeleton', tier: 'green', owner: 'player', hexId: '4,3', moveProgress: 0 },
+  ]
+  const target9 = MoveUnits.selectTarget(BarracksSystem.units[0], BarracksSystem.units, t9)
+  console.assert(target9 === null,
+    'should return null when no enemies exist')
+
+  // === Movement Speed ===
+
+  // 10. Speed 0.4: 25 ticks to advance one hex
+  const t10 = freshTiles()
+  t10['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened', building: { type: 'barracks' } }
+  t10['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened', building: { type: 'hq' } }
+  BarracksSystem.init()
+  BarracksSystem.units = [
+    { key: 'skeleton', tier: 'green', owner: 'player', hexId: '4,5', moveProgress: 0, speed: 0.4 },
+  ]
+  MoveUnits.tick(BarracksSystem.units, t10)
+  console.assert(BarracksSystem.units[0].hexId === '4,5', 'unit should not move on first tick')
+  for (let i = 0; i < 23; i++) MoveUnits.tick(BarracksSystem.units, t10)
+  console.assert(BarracksSystem.units[0].hexId === '4,5',
+    'unit should not move before tick 25')
+  MoveUnits.tick(BarracksSystem.units, t10)
+  console.assert(BarracksSystem.units[0].hexId !== '4,5',
+    'unit should advance after 25 ticks (speed 0.4)')
+
+  // === Push-Claim-Chain ===
+
+  // 11. Moving into enemy hex claims territory
+  const t11 = freshTiles()
+  t11['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened' }
+  t11['5,4'] = { q: 5, r: 4, owner: 'ai', state: 'opened' }
+  t11['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened', building: { type: 'hq' } }
+  TerritorySystem.init()
+  TerritorySystem.claim('5,4', 'ai', t11, SeededRNG)
+  BarracksSystem.init()
+  BarracksSystem.units = [
+    { key: 'wolf', tier: 'green', owner: 'player', hexId: '4,5', moveProgress: 0.96, speed: 0.8 },
+  ]
+  MoveUnits.tick(BarracksSystem.units, t11)
+  console.assert(BarracksSystem.units[0].hexId === '5,4',
+    'unit should advance into enemy hex')
+  console.assert(TerritorySystem.owners['5,4'] === 'player',
+    'enemy hex should be claimed when unit enters')
+
+  // 12. Integration: spawned units get moveProgress
+  BarracksSystem.init()
+  const t12 = freshTiles()
+  t12['3,11'] = { q: 3, r: 11, owner: 'player', state: 'opened', building: { type: 'barracks', tier: 'green' } }
+  BarracksSystem.registerBarracks('3,11')
+  const rng12 = { next() { return 0.3 }, weightedPick(o, w) { return o[0] } }
+  for (let i = 0; i < 30; i++) BarracksSystem.tick(t12, rng12)
+  console.assert(BarracksSystem.units.length === 1, 'should spawn 1 unit')
+  console.assert(BarracksSystem.units[0].moveProgress === 0,
+    `spawned unit should have moveProgress=0, got ${BarracksSystem.units[0].moveProgress}`)
+
+  console.log('[test] MoveUnits tests passed')
 })()
 
 </script>
