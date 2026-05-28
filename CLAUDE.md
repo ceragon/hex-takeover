@@ -1,59 +1,31 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file is a pointer. The authoritative project guide is `AGENTS.md` (single source of truth).
+The domain glossary lives in `CONTEXT.md`.
 
-## Project Overview
+**Always read `AGENTS.md` in full before making any change to this repo.**
 
-**占城大师 (Hex Takeover)** — A single-file HTML game (MuleRun format) implementing hex-map tile revealing, resource management, barracks building, auto-combat with 3-unit counter system, and AI opponent. Zero dependencies, all CSS/JS inline in one `index.html`.
+## Where to look
 
-Deadline: 2026-06-22. Branch from `doc/PRD.md` and `CONTEXT.md`.
+- **AGENTS.md → Project Overview / Key Decisions** — 项目定位、v2 重写状态、交付约束
+- **AGENTS.md → v2 Rewrite Strategy** — v1→v2 模块对应、垂直切片路径
+- **AGENTS.md → Module Architecture** — 模块顺序、依赖关系、插入规则
+- **AGENTS.md → v2 Core Numbers** — 地图尺寸、HQ、价格档位、混合池权重等关键数值
+- **AGENTS.md → Module Insertion Order — CRITICAL** — 新模块必须按依赖插入，否则 `Cannot access before initialization`
+- **AGENTS.md → Code Style** — 无分号、2 空格、中文注释、模块模式
+- **AGENTS.md → Git Workflow** — `main` 直推、`#N` 前缀 commit message
+- **AGENTS.md → Testing Workflow** — 嵌入式 `console.assert` IIFE + Playwright
+- **AGENTS.md → Known Pitfalls** — 已知坑（每次动手前先扫一遍）
 
-## Key Decisions
+## Files to read before making changes
 
-- **Delivery:** Single `index.html`, all resources inlined, open in browser to play
-- **Matchup:** Single-player vs AI (PvE)
-- **Rendering:** Canvas 2D, 10Hz fixed timestep via `requestAnimationFrame`
-- **State:** Single `GameState` object, immutable updates
-- **Hex layout:** Flat-top hexes, pointy-top arrangement, axial coordinates (q, r)
-- **Map:** 5 columns × 7 rows (~35 cells), bases at both ends
-- **Testing:** No test framework — use `console.assert` for embedded logic checks; manual browser verification
+- `AGENTS.md` — 必读
+- `CONTEXT.md` — 涉及领域词汇时必读
+- `doc/design/v2-prd.md` — 涉及新模块设计时按需读
+- `doc/research/gameplay-v2.md` — 涉及数值与机制调研时按需读
+- `docs/adr/0001-v2-architecture-pivot.md` — 涉及 v2 架构决策时按需读
 
-## Module Architecture
+## Do NOT
 
-| Module | Responsibility |
-|--------|---------------|
-| HexGrid | Hex rendering, coordinate math, click picking |
-| TileReveal | Reveal logic, tile content generation |
-| ResourceSystem | Gold income/expense, mine production |
-| BarracksSystem | Build barracks, unit spawning |
-| CombatSystem | Unit movement, engagement, counter system, death |
-| TileOwnership | Cell ownership, faction colors |
-| AIBehavior | AI decision-making (reveal/build/spawn) |
-| GameLoop | 10Hz main loop, win/lose conditions |
-
-## Core Numbers
-
-Refer to `doc/PRD.md` → "核心数值" section for all balance values (gold costs, unit stats, counter multipliers, timings).
-
-## Out of Scope
-
-Card collection/upgrades, multi-faction, unit merge/star, real-time PvP, audio/BGM, mobile adaptation, animation effects. See `doc/PRD.md` → "Out of Scope".
-
-## Working Conventions
-
-- No build tooling — edit `index.html` directly, refresh browser to test
-- No linting or formatting tools — keep code clean and readable
-- Keep all code in one file; no module bundling
-- When adding features, check `doc/PRD.md` first for defined behavior and constraints
-
-## Known Pitfalls
-
-<!-- 由 /work-issues command 自动维护，最多 8 条 -->
-- **Playwright browser_click 参数错误死循环:** `browser_click` 需要 `element`（描述）和 `target`（快照引用），传错参数名（如 `ref`）会报错 `expected string, received undefined`，在 auto mode 下容易陷入"重试→报错→再重试"循环。修复：首次报错后立即检查参数名，查看 Playwright 工具 schema 确认正确参数。
-- **GameLoop 断言时机:** `console.assert(tickCount > 0)` 在 loop 启动前同步执行，tickCount 尚未更新。修复：用 `setTimeout(..., 200)` 延迟验证
-- **Playwright file:// 拦截:** Playwright MCP 阻止 `file://` 协议访问。修复：用 `python3 -m http.server` 提供 HTTP 服务
-- **初始化顺序冲突:** `initGameState()` 在 `TileReveal` 定义之前调用，导致 `Cannot access before initialization`。修复：将依赖模块（HexGrid、TileReveal）放在 GameState 初始化之前
-- **新模块初始化顺序:** 新增模块（如 ResourceSystem、BarracksSystem）必须在 `gameLoop.start()` 之前定义，否则同样触发 `Cannot access before initialization`。修复：新模块紧跟 TileReveal 之后、initGameState 之前
-- **tick 干扰手动测试:** 1Hz 金矿产出 tick 会在测试金币不足时持续加金，导致预期外的翻牌成功。修复：测试金币不足时需同时设置 `mineCount=0` 关闭产出
-- **renderUnits 函数缺少闭合括号:** 新增渲染函数时只闭合了 for 循环，忘记闭合函数本身，导致 JS 语法错误 "Unexpected end of input"。修复：检查新增函数的完整闭合结构
-- **BarracksSystem tick 测试 off-by-one:** 测试中预先调用 BarracksSystem.tick 推进了 spawnTimer，导致预期在第 30 次 tick 产出实际上在第 29 次就触发。修复：移除测试中的前置 tick 调用，从初始状态开始循环
+- Do **not** treat this file as the source of truth. If it conflicts with `AGENTS.md`, `AGENTS.md` wins.
+- Do **not** duplicate content from `AGENTS.md` into this file — update `AGENTS.md` instead.
