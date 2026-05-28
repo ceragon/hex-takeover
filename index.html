@@ -277,6 +277,71 @@ function moveUnits(state) {
 }
 
 // ============================================================
+// CombatSystem: 单位移动、交战、克制、死亡
+// ============================================================
+
+// 平顶六边形相邻坐标偏移（axial）
+const HEX_NEIGHBORS = [
+  { dq: 1, dr: 0 }, { dq: 1, dr: -1 }, { dq: 0, dr: -1 },
+  { dq: -1, dr: 0 }, { dq: -1, dr: 1 }, { dq: 0, dr: 1 }
+];
+
+// 计算克制倍率：attacker.type 对 defender.type
+function getCounterMultiplier(attacker, defender) {
+  if (UNIT_TYPES[attacker.type].counters === defender.type) {
+    return COUNTER_MULTIPLIER; // 克制方 ×1.5
+  }
+  if (UNIT_TYPES[defender.type].counters === attacker.type) {
+    return BEING_COUNTERED_MULTIPLIER; // 被克方 ×0.5
+  }
+  return 1.0; // 无克制关系 ×1.0
+}
+
+// 计算实际伤害
+function calcDamage(attacker, defender) {
+  return Math.round(attacker.atk * getCounterMultiplier(attacker, defender));
+}
+
+// 战斗 tick：每秒检测相邻敌对单位并结算伤害
+function combatTick(state) {
+  const attacks = []; // 记录攻击对，避免重复
+  const attackedPairs = new Set();
+
+  for (let i = 0; i < state.units.length; i++) {
+    const unitA = state.units[i];
+    if (unitA.currentHp <= 0) continue;
+
+    for (let j = i + 1; j < state.units.length; j++) {
+      const unitB = state.units[j];
+      if (unitB.currentHp <= 0) continue;
+
+      // 只处理敌对单位
+      if (unitA.owner === unitB.owner) continue;
+
+      // 检查是否相邻
+      const dq = Math.abs(unitA.q - unitB.q);
+      const dr = Math.abs(unitA.r - unitB.r);
+      const isAdjacent = HEX_NEIGHBORS.some(n =>
+        unitA.q + n.dq === unitB.q && unitA.r + n.dr === unitB.r
+      );
+
+      if (!isAdjacent) continue;
+
+      // 避免重复处理同一对
+      const pairKey = [unitA.tileKey, unitB.tileKey].sort().join('-');
+      if (attackedPairs.has(pairKey)) continue;
+      attackedPairs.add(pairKey);
+
+      // 双方互相攻击（每秒交战频率）
+      const dmgAtoB = calcDamage(unitA, unitB);
+      const dmgBtoA = calcDamage(unitB, unitA);
+      unitB.currentHp -= dmgAtoB;
+      unitA.currentHp -= dmgBtoA;
+    }
+  }
+}
+
+// ============================================================
 // Embedded assertions: HexGrid coordinate generation
 // ============================================================
 (function testHexGrid() {
@@ -608,6 +673,11 @@ const gameLoop = createGameLoop(() => {
     moveUnits(gameState);
   }
 
+  // 战斗：每 1Hz 检测相邻敌对单位并交战
+  if (tickCount % 10 === 0) {
+    combatTick(gameState);
+  }
+
   render();
   renderNotification();
   updateUI();
@@ -843,6 +913,86 @@ const BarracksSystem = {
   console.assert(state.units.length === aliveUnits.length, 'Dead units should be removed after moveUnits');
 
   console.log('[test] Unit movement tests passed');
+})();
+
+// ============================================================
+// Embedded assertions: CombatSystem counter damage
+// ============================================================
+(function testCombatDamage() {
+  // 步兵克制骑兵：步兵 ATK 15 × 1.5 = 22
+  const infantry = { type: 'infantry', atk: 15 };
+  const cavalry = { type: 'cavalry', atk: 18 };
+  const archer = { type: 'archer', atk: 20 };
+
+  console.assert(getCounterMultiplier(infantry, cavalry) === 1.5, 'Infantry vs cavalry should be ×1.5 (counter)');
+  console.assert(getCounterMultiplier(cavalry, infantry) === 0.5, 'Cavalry vs infantry should be ×0.5 (countered)');
+  console.assert(getCounterMultiplier(infantry, infantry) === 1.0, 'Infantry vs infantry should be ×1.0 (no counter)');
+
+  // 骑兵克制弓箭手
+  console.assert(getCounterMultiplier(cavalry, archer) === 1.5, 'Cavalry vs archer should be ×1.5 (counter)');
+  console.assert(getCounterMultiplier(archer, cavalry) === 0.5, 'Archer vs cavalry should be ×0.5 (countered)');
+
+  // 弓箭手克制步兵
+  console.assert(getCounterMultiplier(archer, infantry) === 1.5, 'Archer vs infantry should be ×1.5 (counter)');
+  console.assert(getCounterMultiplier(infantry, archer) === 0.5, 'Infantry vs archer should be ×0.5 (countered)');
+
+  // 实际伤害计算
+  console.assert(calcDamage(infantry, cavalry) === 23, `Infantry vs cavalry damage should be 23 (15*1.5=22.5→23), got ${calcDamage(infantry, cavalry)}`);
+  console.assert(calcDamage(cavalry, infantry) === 9, `Cavalry vs infantry damage should be 9 (18*0.5), got ${calcDamage(cavalry, infantry)}`);
+  console.assert(calcDamage(archer, infantry) === 30, `Archer vs infantry damage should be 30 (20*1.5), got ${calcDamage(archer, infantry)}`);
+  console.assert(calcDamage(infantry, archer) === 8, `Infantry vs archer damage should be 8 (15*0.5=7.5→8), got ${calcDamage(infantry, archer)}`);
+
+  // 测试相邻单位交战
+  const state = {
+    tiles: {
+      '0,0': { q: 0, r: 0, owner: 'player', revealed: true },
+      '1,0': { q: 1, r: 0, owner: 'ai', revealed: true }
+    },
+    units: [
+      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '0,0', q: 0, r: 0 },
+      { type: 'cavalry', name: '骑兵', hp: 180, atk: 18, currentHp: 180, owner: 'ai', tileKey: '1,0', q: 1, r: 0 }
+    ]
+  };
+
+  combatTick(state);
+
+  // 步兵克制骑兵，受到骑兵 9 点伤害，骑兵受到步兵 22 点伤害
+  console.assert(state.units[0].currentHp === 211, `Player infantry should have 211 HP (220-9), got ${state.units[0].currentHp}`);
+  console.assert(state.units[1].currentHp === 157, `AI cavalry should have 157 HP (180-23), got ${state.units[1].currentHp}`);
+
+  // 测试非相邻单位不交战
+  const state2 = {
+    tiles: {
+      '0,0': { q: 0, r: 0, owner: 'player', revealed: true },
+      '3,0': { q: 3, r: 0, owner: 'ai', revealed: true }
+    },
+    units: [
+      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '0,0', q: 0, r: 0 },
+      { type: 'cavalry', name: '骑兵', hp: 180, atk: 18, currentHp: 180, owner: 'ai', tileKey: '3,0', q: 3, r: 0 }
+    ]
+  };
+
+  combatTick(state2);
+  console.assert(state2.units[0].currentHp === 220, 'Non-adjacent units should not take damage');
+  console.assert(state2.units[1].currentHp === 180, 'Non-adjacent units should not take damage');
+
+  // 测试同阵营单位不交战
+  const state3 = {
+    tiles: {
+      '0,0': { q: 0, r: 0, owner: 'player', revealed: true },
+      '1,0': { q: 1, r: 0, owner: 'player', revealed: true }
+    },
+    units: [
+      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '0,0', q: 0, r: 0 },
+      { type: 'cavalry', name: '骑兵', hp: 180, atk: 18, currentHp: 180, owner: 'player', tileKey: '1,0', q: 1, r: 0 }
+    ]
+  };
+
+  combatTick(state3);
+  console.assert(state3.units[0].currentHp === 220, 'Same-faction units should not fight');
+  console.assert(state3.units[1].currentHp === 180, 'Same-faction units should not fight');
+
+  console.log('[test] Combat damage tests passed');
 })();
 
 // ============================================================
