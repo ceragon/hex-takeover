@@ -16,1354 +16,354 @@
     color: #eee;
     min-height: 100vh;
   }
-  #ui-bar {
-    width: 100%;
-    max-width: 600px;
-    display: flex;
-    justify-content: space-between;
-    padding: 8px 16px;
-    background: #16213e;
-    border-bottom: 2px solid #0f3460;
-  }
-  .gold-display {
-    font-size: 16px;
-    padding: 4px 12px;
-  }
   #game-canvas {
     border: 2px solid #0f3460;
-    margin-top: 8px;
+    margin-top: 16px;
     cursor: pointer;
-  }
-  #game-over-overlay {
-    display: none;
-    position: fixed;
-    top: 0; left: 0; right: 0; bottom: 0;
-    background: rgba(0, 0, 0, 0.75);
-    justify-content: center;
-    align-items: center;
-    z-index: 100;
-  }
-  #game-over-overlay.visible {
-    display: flex;
-  }
-  #game-over-box {
-    background: #16213e;
-    border: 3px solid #0f3460;
-    border-radius: 12px;
-    padding: 32px 48px;
-    text-align: center;
-  }
-  #game-over-title {
-    font-size: 28px;
-    margin-bottom: 16px;
-  }
-  #game-over-title.win { color: #4caf50; }
-  #game-over-title.lose { color: #f44336; }
-  #restart-btn {
-    padding: 10px 24px;
-    font-size: 16px;
-    font-family: monospace;
-    background: #0f3460;
-    color: #eee;
-    border: 2px solid #2266cc;
-    border-radius: 6px;
-    cursor: pointer;
-  }
-  #restart-btn:hover {
-    background: #2266cc;
+    background: #0a0a1a;
   }
 </style>
 </head>
 <body>
 
-<div id="ui-bar">
-  <div class="gold-display" id="player-gold">玩家: 0 金</div>
-  <div class="gold-display" id="ai-gold">AI: 0 金</div>
-</div>
-<canvas id="game-canvas" width="600" height="500"></canvas>
-
-<div id="game-over-overlay">
-  <div id="game-over-box">
-    <div id="game-over-title"></div>
-    <button id="restart-btn">重新开始</button>
-  </div>
-</div>
+<canvas id="game-canvas" width="560" height="460"></canvas>
 
 <script>
 // ============================================================
 // GameLoop: 10Hz fixed timestep via requestAnimationFrame
 // ============================================================
 function createGameLoop(updateFn) {
-  const STEP = 100; // 100ms = 10Hz
-  let lastTime = 0;
-  let accumulator = 0;
-  let running = false;
+  const STEP = 100
+  let lastTime = 0
+  let accumulator = 0
+  let running = false
 
   function loop(timestamp) {
-    if (!running) return;
-    if (!lastTime) lastTime = timestamp;
-    const delta = timestamp - lastTime;
-    lastTime = timestamp;
-    accumulator += delta;
+    if (!running) return
+    if (!lastTime) lastTime = timestamp
+    const delta = timestamp - lastTime
+    lastTime = timestamp
+    accumulator += delta
 
     while (accumulator >= STEP) {
-      updateFn();
-      accumulator -= STEP;
+      updateFn()
+      accumulator -= STEP
     }
 
-    requestAnimationFrame(loop);
+    requestAnimationFrame(loop)
   }
 
   return {
-    start() { running = true; lastTime = 0; requestAnimationFrame(loop); },
-    stop() { running = false; }
-  };
+    start() { running = true; lastTime = 0; requestAnimationFrame(loop) },
+    stop() { running = false }
+  }
 }
 
 // ============================================================
-// HexGrid: 六边形网格坐标计算与渲染
+// HexGrid: 9 列 × 12 行 + 1 行中央湖水（r=LAKE_ROW）的平顶六边形网格
+// 坐标系：axial (q, r)，q ∈ [0, COLS)，r ∈ [0, ROWS)，r=LAKE_ROW 为湖水
+// 平顶六边形，odd-r 水平偏移布局
 // ============================================================
 const HexGrid = {
-  cols: 5,
-  rows: 7,
-  hexSize: 32,
+  COLS: 9,
+  ROWS: 13,
+  LAKE_ROW: 6,
+  hexSize: 24,
 
-  // 生成 5×7 网格的所有轴向坐标 (q, r)
-  generateCoords(cols, rows) {
-    const coords = [];
-    for (let r = 0; r < rows; r++) {
-      for (let q = 0; q < cols; q++) {
-        coords.push({ q, r });
+  isInBounds(q, r) {
+    return Number.isInteger(q) && Number.isInteger(r)
+      && q >= 0 && q < this.COLS
+      && r >= 0 && r < this.ROWS
+  },
+
+  isLake(q, r) {
+    return r === this.LAKE_ROW && q >= 0 && q < this.COLS
+  },
+
+  generateCoords() {
+    const coords = []
+    for (let r = 0; r < this.ROWS; r++) {
+      for (let q = 0; q < this.COLS; q++) {
+        coords.push({ q, r })
       }
     }
-    return coords;
+    return coords
   },
 
-  // 平顶六边形：轴向坐标 → 像素中心点
-  hexToPixel(q, r, size) {
-    const x = size * (Math.sqrt(3) * q + Math.sqrt(3) / 2 * r);
-    const y = size * (1.5 * r);
-    return { x, y };
-  }
-};
-
-// ============================================================
-// TileReveal: 翻牌逻辑、地块内容生成
-// ============================================================
-const TileReveal = {
-  // 地块类型权重: 40%金矿 / 30%空地 / 20%野怪 / 10%特殊
-  TILE_TYPES: [
-    { type: 'mine', weight: 40 },
-    { type: 'empty', weight: 30 },
-    { type: 'monster', weight: 20 },
-    { type: 'special', weight: 10 }
-  ],
-
-  // 简单种子随机数生成器
-  seededRandom(seed) {
-    let s = seed;
-    return function() {
-      s = (s * 16807 + 0) % 2147483647;
-      return (s - 1) / 2147483646;
-    };
+  // 轴向坐标 → 像素中心点（平地公式，湖水行以下整体下移半个六边形高度作为视觉间隔）
+  axialToPixel(q, r) {
+    const size = this.hexSize
+    const lakeGap = (r > this.LAKE_ROW ? 1 : 0) * size * Math.sqrt(3) * 0.5
+    const x = size * (Math.sqrt(3) * q + Math.sqrt(3) / 2 * r)
+    const y = size * (1.5 * r) + lakeGap
+    return { x, y }
   },
 
-  // 根据权重选择地块类型
-  pickTileType(rng) {
-    const roll = rng() * 100;
-    let cumulative = 0;
-    for (const t of this.TILE_TYPES) {
-      cumulative += t.weight;
-      if (roll < cumulative) return t.type;
-    }
-    return this.TILE_TYPES[this.TILE_TYPES.length - 1].type;
+  hexToPixel(q, r) {
+    return this.axialToPixel(q, r)
   },
 
-  // 使用固定种子生成地图地块分布
-  generateMap(cols, rows, seed = 42) {
-    const rng = this.seededRandom(seed);
-    const coords = HexGrid.generateCoords(cols, rows);
-    const tiles = {};
-
-    for (const { q, r } of coords) {
-      const key = `${q},${r}`;
-      tiles[key] = {
-        q, r,
-        revealed: false,
-        type: this.pickTileType(rng),
-        owner: 'neutral'
-      };
+  // 像素点 → 最近的轴向坐标（cube rounding + 湖水偏移反算 + 边界钳制）
+  pixelToAxial(px, py) {
+    const size = this.hexSize
+    const lakeOffsetY = this.hexSize * Math.sqrt(3) * 0.5
+    let adjustedY = py
+    if (py > this.axialToPixel(0, this.LAKE_ROW).y + lakeOffsetY * 0.5) {
+      adjustedY -= lakeOffsetY
     }
 
-    // 大本营：玩家端 r=0 中间列，AI 端 r=rows-1 中间列
-    const midCol = Math.floor(cols / 2);
-    const playerBaseKey = `${midCol},0`;
-    const aiBaseKey = `${midCol},${rows - 1}`;
+    const fq = (Math.sqrt(3) / 3 * px - 1 / 3 * adjustedY) / size
+    const fr = (2 / 3 * adjustedY) / size
 
-    tiles[playerBaseKey].revealed = true;
-    tiles[playerBaseKey].type = 'base';
-    tiles[playerBaseKey].owner = 'player';
+    let x = fq
+    let z = fr
+    let y = -x - z
+    let rx = Math.round(x)
+    let ry = Math.round(y)
+    let rz = Math.round(z)
+    const dx = Math.abs(rx - x)
+    const dy = Math.abs(ry - y)
+    const dz = Math.abs(rz - z)
+    if (dx > dy && dx > dz) rx = -ry - rz
+    else if (dy > dz) ry = -rx - rz
+    else rz = -rx - ry
 
-    tiles[aiBaseKey].revealed = true;
-    tiles[aiBaseKey].type = 'base';
-    tiles[aiBaseKey].owner = 'ai';
-
-    return { tiles, playerBase: playerBaseKey, aiBase: aiBaseKey };
+    let q = rx
+    let r = rz
+    if (r === this.LAKE_ROW) r = py < this.axialToPixel(0, this.LAKE_ROW).y ? this.LAKE_ROW - 1 : this.LAKE_ROW + 1
+    return { q, r }
   },
 
-  // 尝试翻牌：返回翻牌结果（不做金币检查，由 ResourceSystem 处理）
-  reveal(tileKey, tiles) {
-    const tile = tiles[tileKey];
-    if (!tile || tile.revealed) {
-      return { success: false, reason: tile ? 'already revealed' : 'invalid tile' };
+  // 返回 (q, r) 的 6 个邻居，过滤掉越界与湖水格；输入若为湖水或越界则返回 []
+  getNeighbors(q, r) {
+    if (!this.isInBounds(q, r) || this.isLake(q, r)) return []
+    const offsets = (r % 2 === 0)
+      ? [[1, 0], [-1, 0], [1, -1], [0, -1], [1, 1], [0, 1]]
+      : [[1, 0], [-1, 0], [0, -1], [-1, -1], [0, 1], [-1, 1]]
+    const result = []
+    for (const [dq, dr] of offsets) {
+      const nq = q + dq
+      const nr = r + dr
+      if (this.isInBounds(nq, nr) && !this.isLake(nq, nr)) {
+        result.push({ q: nq, r: nr })
+      }
     }
-    tile.revealed = true;
-    return { success: true, tileType: tile.type };
-  }
-};
-
-// ============================================================
-// ResourceSystem: 金币收入/支出、金矿产出
-// ============================================================
-const ResourceSystem = {
-  REVEAL_COST: 10,
-  MINE_BONUS: 50,       // 翻出金矿立即获得
-  MINE_INCOME: 5,       // 每秒每个金矿产出
-  INCOME_INTERVAL: 1000, // 1Hz tick 间隔(ms)
-
-  // 创建资源状态
-  create(initialGold = 50) {
-    return { gold: initialGold, mineCount: 0 };
+    return result
   },
 
-  // 尝试翻牌：消耗金币，返回结果
-  tryReveal(resources) {
-    if (resources.gold < this.REVEAL_COST) {
-      return { success: false, reason: 'not enough gold' };
-    }
-    resources.gold -= this.REVEAL_COST;
-    return { success: true };
-  },
-
-  // 翻出金矿：立即获得启动资金 + 记录金矿数量
-  onMineRevealed(resources) {
-    resources.gold += this.MINE_BONUS;
-    resources.mineCount++;
-  },
-
-  // 1Hz tick：根据金矿数量产出金币
-  tick(resources) {
-    const income = resources.mineCount * this.MINE_INCOME;
-    if (income > 0) {
-      resources.gold += income;
-    }
-    return income;
-  }
-};
-
-// ============================================================
-// Unit movement: move toward enemy base, claim neutral tiles
-// ============================================================
-function moveUnits(state) {
-  const enemyBaseFor = {
-    player: state.aiBase,
-    ai: state.playerBase
-  };
-
-  // 按单位分组（同一格子多个单位只移动一次）
-  const moved = new Set();
-
-  for (const unit of state.units) {
-    if (unit.currentHp <= 0) continue;
-    const unitId = `${unit.type}-${unit.tileKey}-${unit.owner}`;
-    if (moved.has(unitId)) continue;
-    moved.add(unitId);
-
-    const targetBase = enemyBaseFor[unit.owner];
-    const [targetQ, targetR] = targetBase.split(',').map(Number);
-
-    // 计算向目标方向的一步移动（axial 坐标差）
-    const dq = Math.sign(targetQ - unit.q);
-    const dr = Math.sign(targetR - unit.r);
-
-    // 尝试移动到的下一个格子
-    let nextQ = unit.q + dq;
-    let nextR = unit.r + dr;
-
-    // 如果某个方向已对齐，只移动另一个方向
-    if (targetQ === unit.q) nextQ = unit.q;
-    if (targetR === unit.r) nextR = unit.r;
-
-    // 边界检查
-    nextQ = Math.max(0, Math.min(MAP_COLS - 1, nextQ));
-    nextR = Math.max(0, Math.min(MAP_ROWS - 1, nextR));
-
-    if (nextQ === unit.q && nextR === unit.r) continue; // 已在目标或无法移动
-
-    const nextKey = `${nextQ},${nextR}`;
-    const nextTile = state.tiles[nextKey];
-
-    if (nextTile && nextTile.revealed && nextTile.owner === 'neutral') {
-      // 占领中立格子
-      nextTile.owner = unit.owner;
-      unit.tileKey = nextKey;
-      unit.q = nextQ;
-      unit.r = nextR;
-    } else if (nextTile && nextTile.revealed && nextTile.owner !== unit.owner) {
-      // 移动到敌方格子：占领并改变归属
-      nextTile.owner = unit.owner;
-      unit.tileKey = nextKey;
-      unit.q = nextQ;
-      unit.r = nextR;
-    }
-  }
-
-  // 清理死亡单位
-  state.units = state.units.filter(u => u.currentHp > 0);
-}
-
-// ============================================================
-// Victory/defeat detection
-// ============================================================
-function checkVictory(state) {
-  for (const unit of state.units) {
-    if (unit.currentHp <= 0) continue;
-    // 玩家单位占领 AI 大本营 → 玩家胜利
-    if (unit.owner === 'player' && unit.tileKey === state.aiBase) {
-      return 'player_win';
-    }
-    // AI 单位占领玩家大本营 → AI 胜利
-    if (unit.owner === 'ai' && unit.tileKey === state.playerBase) {
-      return 'ai_win';
-    }
-  }
-  return null;
-}
-
-// ============================================================
-// CombatSystem: 单位移动、交战、克制、死亡
-// ============================================================
-
-// 平顶六边形相邻坐标偏移（axial）
-const HEX_NEIGHBORS = [
-  { dq: 1, dr: 0 }, { dq: 1, dr: -1 }, { dq: 0, dr: -1 },
-  { dq: -1, dr: 0 }, { dq: -1, dr: 1 }, { dq: 0, dr: 1 }
-];
-
-// 计算克制倍率：attacker.type 对 defender.type
-function getCounterMultiplier(attacker, defender) {
-  if (UNIT_TYPES[attacker.type].counters === defender.type) {
-    return COUNTER_MULTIPLIER; // 克制方 ×1.5
-  }
-  if (UNIT_TYPES[defender.type].counters === attacker.type) {
-    return BEING_COUNTERED_MULTIPLIER; // 被克方 ×0.5
-  }
-  return 1.0; // 无克制关系 ×1.0
-}
-
-// 计算实际伤害
-function calcDamage(attacker, defender) {
-  return Math.round(attacker.atk * getCounterMultiplier(attacker, defender));
-}
-
-// 战斗 tick：每秒检测相邻敌对单位并结算伤害
-function combatTick(state) {
-  const attacks = []; // 记录攻击对，避免重复
-  const attackedPairs = new Set();
-
-  for (let i = 0; i < state.units.length; i++) {
-    const unitA = state.units[i];
-    if (unitA.currentHp <= 0) continue;
-
-    for (let j = i + 1; j < state.units.length; j++) {
-      const unitB = state.units[j];
-      if (unitB.currentHp <= 0) continue;
-
-      // 只处理敌对单位
-      if (unitA.owner === unitB.owner) continue;
-
-      // 检查是否相邻
-      const dq = Math.abs(unitA.q - unitB.q);
-      const dr = Math.abs(unitA.r - unitB.r);
-      const isAdjacent = HEX_NEIGHBORS.some(n =>
-        unitA.q + n.dq === unitB.q && unitA.r + n.dr === unitB.r
-      );
-
-      if (!isAdjacent) continue;
-
-      // 避免重复处理同一对
-      const pairKey = [unitA.tileKey, unitB.tileKey].sort().join('-');
-      if (attackedPairs.has(pairKey)) continue;
-      attackedPairs.add(pairKey);
-
-      // 双方互相攻击（每秒交战频率）
-      const dmgAtoB = calcDamage(unitA, unitB);
-      const dmgBtoA = calcDamage(unitB, unitA);
-      unitB.currentHp -= dmgAtoB;
-      unitA.currentHp -= dmgBtoA;
-    }
+  // 像素坐标命中查询：返回最近的非湖水格子；点中湖水或越界返回 null
+  findHexAt(px, py) {
+    const hex = this.pixelToAxial(px, py)
+    if (!this.isInBounds(hex.q, hex.r)) return null
+    if (this.isLake(hex.q, hex.r)) return null
+    return hex
   }
 }
 
 // ============================================================
-// Embedded assertions: HexGrid coordinate generation
+// v2 Slice 1: GameState（最小可运行骨架）
+// 仅保留地图格子与双方 HQ 位置，供渲染与点击使用
+// 完整 TileSystem / ResourceSystem / BarracksSystem 将在后续切片加入
 // ============================================================
-(function testHexGrid() {
-  const coords = HexGrid.generateCoords(5, 7);
-  console.assert(coords.length === 35, `HexGrid should generate 35 coords for 5x7, got ${coords.length}`);
-
-  // 检查边界坐标
-  console.assert(coords[0].q === 0 && coords[0].r === 0, 'First coord should be (0,0)');
-  console.assert(coords[34].q === 4 && coords[34].r === 6, 'Last coord should be (4,6)');
-
-  // 检查像素坐标计算
-  const px = HexGrid.hexToPixel(0, 0, 32);
-  console.assert(px.x === 0 && px.y === 0, 'hexToPixel(0,0) should be (0,0)');
-
-  const px2 = HexGrid.hexToPixel(1, 0, 32);
-  console.assert(Math.abs(px2.x - 32 * Math.sqrt(3)) < 0.001, 'hexToPixel(1,0) x should be size*sqrt(3)');
-  console.assert(px2.y === 0, 'hexToPixel(1,0) y should be 0 for same row');
-
-  console.log('[test] HexGrid coordinate tests passed');
-})();
-
-// ============================================================
-// Embedded assertions: TileReveal map generation
-// ============================================================
-(function testTileReveal() {
-  // 测试固定种子可复现
-  const map1 = TileReveal.generateMap(5, 7, 42);
-  const map2 = TileReveal.generateMap(5, 7, 42);
-  console.assert(JSON.stringify(map1.tiles) === JSON.stringify(map2.tiles), 'Same seed should produce identical maps');
-
-  // 测试大本营位置
-  console.assert(map1.tiles['2,0'].revealed === true, 'Player base at (2,0) should be revealed');
-  console.assert(map1.tiles['2,0'].type === 'base', 'Player base type should be "base"');
-  console.assert(map1.tiles['2,0'].owner === 'player', 'Player base owner should be "player"');
-  console.assert(map1.tiles['2,6'].revealed === true, 'AI base at (2,6) should be revealed');
-  console.assert(map1.tiles['2,6'].owner === 'ai', 'AI base owner should be "ai"');
-
-  // 测试其他格子初始为迷雾
-  console.assert(map1.tiles['0,1'].revealed === false, 'Non-base tiles should start as fog');
-
-  // 测试翻牌消耗（金币检查由 ResourceSystem 处理，这里只测状态变更）
-  const result = TileReveal.reveal('0,1', map1.tiles);
-  console.assert(result.success === true, 'Reveal un-revealed tile should succeed');
-  console.assert(result.tileType !== undefined, 'Result should include tileType');
-  console.assert(map1.tiles['0,1'].revealed === true, 'Tile should be revealed after success');
-
-  // 测试已翻牌
-  const dupResult = TileReveal.reveal('0,1', map1.tiles);
-  console.assert(dupResult.success === false, 'Revealing already revealed tile should fail');
-
-  console.log('[test] TileReveal tests passed');
-})();
-
-// ============================================================
-// GameState initialization
-// ============================================================
-const MAP_COLS = 5;
-const MAP_ROWS = 7;
-const MAP_SEED = 42;
+const PLAYER_HQ = { q: 4, r: 12 }
+const AI_HQ = { q: 4, r: 0 }
 
 function initGameState() {
-  const map = TileReveal.generateMap(MAP_COLS, MAP_ROWS, MAP_SEED);
-
-  // 双方大本营初始各有一个兵营（公平开局）
-  map.tiles[map.playerBase].building = 'barracks';
-  map.tiles[map.playerBase].spawnTimer = 0;
-  map.tiles[map.aiBase].building = 'barracks';
-  map.tiles[map.aiBase].spawnTimer = 0;
-
-  return {
-    playerResources: ResourceSystem.create(50),
-    aiResources: ResourceSystem.create(50),
-    lastIncomeTime: 0,
-    units: [],
-    ...map
-  };
-}
-
-let gameState = initGameState();
-let isGameOver = false;
-
-// 显示游戏结束覆盖层
-function showGameOver(result) {
-  isGameOver = true;
-  gameLoop.stop();
-  const overlay = document.getElementById('game-over-overlay');
-  const title = document.getElementById('game-over-title');
-  if (result === 'player_win') {
-    title.textContent = '胜利！';
-    title.className = 'win';
-  } else {
-    title.textContent = '失败！';
-    title.className = 'lose';
+  const tiles = {}
+  for (let r = 0; r < HexGrid.ROWS; r++) {
+    for (let q = 0; q < HexGrid.COLS; q++) {
+      tiles[`${q},${r}`] = { q, r, owner: null }
+    }
   }
-  overlay.classList.add('visible');
+  tiles[`${PLAYER_HQ.q},${PLAYER_HQ.r}`].owner = 'player'
+  tiles[`${AI_HQ.q},${AI_HQ.r}`].owner = 'ai'
+  return { tiles }
 }
 
-// 重新开始游戏
-function restartGame() {
-  const overlay = document.getElementById('game-over-overlay');
-  overlay.classList.remove('visible');
-  gameState = initGameState();
-  isGameOver = false;
-  tickCount = 0;
-  AIBehavior.revealTimer = 0;
-  AIBehavior.buildCheckTimer = 0;
-  notificationText = '';
-  notificationTimer = 0;
-  updateUI();
-  render();
-  gameLoop.start();
-}
-
-document.getElementById('restart-btn').addEventListener('click', restartGame);
+let gameState = initGameState()
+let tickCount = 0
 
 // ============================================================
-// UI update
+// Canvas setup + render
 // ============================================================
-function updateUI() {
-  document.getElementById('player-gold').textContent = `玩家: ${gameState.playerResources.gold} 金`;
-  document.getElementById('ai-gold').textContent = `AI: ${gameState.aiResources.gold} 金`;
-}
+const canvas = document.getElementById('game-canvas')
+const ctx = canvas.getContext('2d')
 
-// ============================================================
-// Canvas setup
-// ============================================================
-const canvas = document.getElementById('game-canvas');
-const ctx = canvas.getContext('2d');
+const RENDER_OFFSET = { x: 75, y: 35 }
 
-// 地块颜色映射
-const TILE_COLORS = {
-  fog: '#2a2a4a',
-  mine: '#b8860b',
-  empty: '#4a6741',
-  monster: '#8b0000',
-  special: '#4b0082',
-  base_player: '#2266cc',
-  base_ai: '#cc2222'
-};
-
-// 绘制单个六边形（平顶）
 function drawHex(cx, cy, size, fillColor, strokeColor = '#333') {
-  ctx.beginPath();
+  ctx.beginPath()
   for (let i = 0; i < 6; i++) {
-    const angle = Math.PI / 180 * (60 * i - 30);
-    const x = cx + size * Math.cos(angle);
-    const y = cy + size * Math.sin(angle);
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
+    const angle = Math.PI / 180 * (60 * i)
+    const x = cx + size * Math.cos(angle)
+    const y = cy + size * Math.sin(angle)
+    if (i === 0) ctx.moveTo(x, y)
+    else ctx.lineTo(x, y)
   }
-  ctx.closePath();
-  ctx.fillStyle = fillColor;
-  ctx.fill();
-  ctx.strokeStyle = strokeColor;
-  ctx.stroke();
+  ctx.closePath()
+  ctx.fillStyle = fillColor
+  ctx.fill()
+  ctx.strokeStyle = strokeColor
+  ctx.lineWidth = 1
+  ctx.stroke()
 }
 
-// 绘制文字在六边形中心
 function drawHexLabel(cx, cy, text, fontSize = 10, color = '#fff') {
-  ctx.fillStyle = color;
-  ctx.font = `${fontSize}px monospace`;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(text, cx, cy);
+  ctx.fillStyle = color
+  ctx.font = `${fontSize}px monospace`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(text, cx, cy)
 }
 
-// ============================================================
-// Render the full grid
-// ============================================================
 function renderGrid() {
-  if (!gameState) return;
-  const { tiles } = gameState;
-  const size = HexGrid.hexSize;
+  const size = HexGrid.hexSize
 
-  ctx.fillStyle = '#0a0a1a';
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#0a0a1a'
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
 
-  for (const key of Object.keys(tiles)) {
-    const tile = tiles[key];
-    const { x, y } = HexGrid.hexToPixel(tile.q, tile.r, size);
+  // 湖水带：在 LAKE_ROW 的垂直位置画一条贯穿的蓝色条
+  const lakeY = HexGrid.axialToPixel(0, HexGrid.LAKE_ROW).y
+  const lakeBandHeight = size * Math.sqrt(3) * 0.5
+  ctx.fillStyle = '#1e3a5f'
+  ctx.fillRect(0, lakeY - lakeBandHeight / 2, canvas.width, lakeBandHeight)
 
-    // 偏移使地图居中
-    const offsetX = 100;
-    const offsetY = 100;
-    const cx = x + offsetX;
-    const cy = y + offsetY;
+  for (let r = 0; r < HexGrid.ROWS; r++) {
+    if (r === HexGrid.LAKE_ROW) continue
+    for (let q = 0; q < HexGrid.COLS; q++) {
+      const { x, y } = HexGrid.axialToPixel(q, r)
+      const cx = x + RENDER_OFFSET.x
+      const cy = y + RENDER_OFFSET.y
 
-    let color;
-    if (!tile.revealed) {
-      color = TILE_COLORS.fog;
-    } else if (tile.type === 'base') {
-      color = tile.owner === 'player' ? TILE_COLORS.base_player : TILE_COLORS.base_ai;
-    } else {
-      color = TILE_COLORS[tile.type] || TILE_COLORS.fog;
+      let color = '#3a3a5a'
+      if (q === PLAYER_HQ.q && r === PLAYER_HQ.r) color = '#2266cc'
+      else if (q === AI_HQ.q && r === AI_HQ.r) color = '#cc2222'
+
+      drawHex(cx, cy, size - 1, color)
+
+      if (q === PLAYER_HQ.q && r === PLAYER_HQ.r) {
+        drawHexLabel(cx, cy, '己方HQ', 9, '#fff')
+      } else if (q === AI_HQ.q && r === AI_HQ.r) {
+        drawHexLabel(cx, cy, '敌方HQ', 9, '#fff')
+      }
     }
-
-    drawHex(cx, cy, size - 1, color);
-
-    // 已翻开的显示类型标签
-    if (tile.revealed) {
-      const labels = { mine: '金矿', empty: '空地', monster: '野怪', special: '特殊', base: '大本营' };
-      drawHexLabel(cx, cy, labels[tile.type] || '', 9);
-    }
-
-    // 兵营标识
-    if (tile.building === 'barracks') {
-      drawHexLabel(cx, cy - 10, '兵营', 8, '#ffff00');
-    }
-  }
-}
-
-// 绘制单位
-function renderUnits() {
-  if (!gameState || !gameState.units) return;
-  const size = HexGrid.hexSize;
-  const offsetX = 100;
-  const offsetY = 100;
-
-  for (const unit of gameState.units) {
-    const { x, y } = HexGrid.hexToPixel(unit.q, unit.r, size);
-    const cx = x + offsetX;
-    const cy = y + offsetY;
-
-    // 单位图标（兵种首字）
-    const icon = unit.name[0];
-    const color = unit.owner === 'player' ? '#66aaff' : '#ff6666';
-    drawHexLabel(cx, cy + 10, icon, 11, color);
-
-    // 血条
-    const hpRatio = unit.currentHp / unit.hp;
-    const barWidth = 20;
-    const barHeight = 3;
-    const barX = cx - barWidth / 2;
-    const barY = cy + 16;
-    ctx.fillStyle = '#333';
-    ctx.fillRect(barX, barY, barWidth, barHeight);
-    ctx.fillStyle = hpRatio > 0.5 ? '#4caf50' : hpRatio > 0.25 ? '#ff9800' : '#f44336';
-    ctx.fillRect(barX, barY, barWidth * hpRatio, barHeight);
   }
 }
 
 function render() {
-  renderGrid();
-  renderUnits();
+  renderGrid()
 }
 
 // ============================================================
-// Click handling: reveal tiles on click
+// Click handling（slice 1：仅做命中检测，湖水格无反应）
 // ============================================================
 canvas.addEventListener('click', (event) => {
-  if (isGameOver) return; // 游戏结束后禁止操作
-  const rect = canvas.getBoundingClientRect();
-  const mx = event.clientX - rect.left;
-  const my = event.clientY - rect.top;
+  const rect = canvas.getBoundingClientRect()
+  const mx = event.clientX - rect.left - RENDER_OFFSET.x
+  const my = event.clientY - rect.top - RENDER_OFFSET.y
 
-  const clickedHex = findHexAt(mx, my);
-  if (!clickedHex) return;
-
-  const tileKey = `${clickedHex.q},${clickedHex.r}`;
-  const tile = gameState.tiles[tileKey];
-  if (!tile) return;
-
-  // 迷雾地块：翻牌
-  if (!tile.revealed) {
-    const revealResult = ResourceSystem.tryReveal(gameState.playerResources);
-    if (!revealResult.success) {
-      if (revealResult.reason === 'not enough gold') {
-        showNotification('金币不足！');
-      }
-      return;
-    }
-
-    const result = TileReveal.reveal(tileKey, gameState.tiles);
-    if (result.success) {
-      if (result.tileType === 'mine') {
-        ResourceSystem.onMineRevealed(gameState.playerResources);
-      }
-    }
-    updateUI();
-    render();
-    return;
-  }
-
-  // 已翻开的空地：尝试建造兵营
-  if (tile.revealed && tile.type === 'empty' && tile.owner === 'player') {
-    const buildResult = BarracksSystem.tryBuild(gameState.playerResources, tile, tileKey, gameState.tiles, 'player');
-    if (buildResult.success) {
-      showNotification('兵营建造成功！');
-    } else if (buildResult.reason === 'not enough gold') {
-      showNotification('金币不足！');
-    } else if (buildResult.reason === 'already has barracks') {
-      showNotification('已有兵营！');
-    }
-    updateUI();
-    render();
-    return;
-  }
-});
-
-// 查找鼠标位置对应的六边形（通过最近距离匹配）
-function findHexAt(mx, my) {
-  const { tiles } = gameState;
-  const size = HexGrid.hexSize;
-  const offsetX = 100;
-  const offsetY = 100;
-
-  let closest = null;
-  let closestDist = Infinity;
-
-  for (const key of Object.keys(tiles)) {
-    const tile = tiles[key];
-    const { x, y } = HexGrid.hexToPixel(tile.q, tile.r, size);
-    const cx = x + offsetX;
-    const cy = y + offsetY;
-
-    const dist = Math.sqrt((mx - cx) ** 2 + (my - cy) ** 2);
-    if (dist < closestDist && dist < size) {
-      closestDist = dist;
-      closest = tile;
-    }
-  }
-  return closest;
-}
-
-// 简单通知提示
-let notificationText = '';
-let notificationTimer = 0;
-
-function showNotification(text, duration = 1500) {
-  notificationText = text;
-  notificationTimer = duration;
-}
-
-function renderNotification() {
-  if (notificationTimer > 0) {
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-    ctx.fillRect(canvas.width / 2 - 60, canvas.height - 40, 120, 30);
-    ctx.fillStyle = '#fff';
-    ctx.font = '12px monospace';
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillText(notificationText, canvas.width / 2, canvas.height - 25);
-  }
-}
+  const hex = HexGrid.findHexAt(mx, my)
+  if (!hex) return
+  console.log(`[click] 命中格子 q=${hex.q}, r=${hex.r}`)
+})
 
 // ============================================================
-// Main loop: 10Hz update
+// Main loop: 10Hz
 // ============================================================
-let tickCount = 0;
 const gameLoop = createGameLoop(() => {
-  tickCount++;
-  if (notificationTimer > 0) {
-    notificationTimer -= 100;
-    if (notificationTimer <= 0) notificationText = '';
-  }
+  tickCount++
+})
 
-  // 1Hz 金矿产出 tick（每 10 个 100ms tick 触发一次）
-  if (tickCount % 10 === 0) {
-    ResourceSystem.tick(gameState.playerResources);
-    ResourceSystem.tick(gameState.aiResources);
-  }
-
-  // 兵营每 100ms tick 产出单位
-  const playerUnits = BarracksSystem.tick(gameState.tiles, 'player', gameState.aiBase);
-  const aiUnits = BarracksSystem.tick(gameState.tiles, 'ai', gameState.playerBase);
-  if (playerUnits.length > 0 || aiUnits.length > 0) {
-    gameState.units = (gameState.units || []).concat(playerUnits, aiUnits);
-  }
-
-  // AI 行为树 tick
-  AIBehavior.tick(gameState);
-
-  // 单位移动：每 1Hz 移动一次（向敌方大本营方向）
-  if (tickCount % 10 === 0) {
-    moveUnits(gameState);
-  }
-
-  // 战斗：每 1Hz 检测相邻敌对单位并交战
-  if (tickCount % 10 === 0) {
-    combatTick(gameState);
-  }
-
-  // 胜负判定
-  const victoryResult = checkVictory(gameState);
-  if (victoryResult !== null) {
-    showGameOver(victoryResult);
-    return; // 停止本轮后续更新
-  }
-
-  render();
-  renderNotification();
-  updateUI();
-});
-
-gameLoop.start();
+render()
+gameLoop.start()
 
 // ============================================================
-// BarracksSystem: 兵营建造、单位产出调度
+// Embedded assertions: HexGrid (v2 — 9×12 + 湖水)
 // ============================================================
-const UNIT_TYPES = {
-  infantry:  { name: '步兵', hp: 220, atk: 15, counters: 'cavalry' },
-  cavalry:   { name: '骑兵', hp: 180, atk: 18, counters: 'archer' },
-  archer:    { name: '弓箭手', hp: 120, atk: 20, counters: 'infantry' }
-};
+;(function testHexGrid() {
+  // 1. 地图尺寸与湖水
+  const coords = HexGrid.generateCoords()
+  console.assert(coords.length === 9 * 13, `应生成 117 个格子，实际 ${coords.length}`)
 
-const COUNTER_MULTIPLIER = 1.5;
-const BEING_COUNTERED_MULTIPLIER = 0.5;
-
-const BarracksSystem = {
-  BUILD_COST: 40,
-  SPAWN_INTERVAL: 3000, // 3 秒产出一个单位
-
-  // 尝试建造兵营：消耗金币，在空地格创建兵营
-  tryBuild(resources, tile, tileKey, tiles, owner) {
-    if (tile.type !== 'empty') {
-      return { success: false, reason: 'not empty tile' };
-    }
-    if (tile.owner !== owner) {
-      return { success: false, reason: 'not owned' };
-    }
-    if (tile.building === 'barracks') {
-      return { success: false, reason: 'already has barracks' };
-    }
-    if (resources.gold < this.BUILD_COST) {
-      return { success: false, reason: 'not enough gold' };
-    }
-
-    resources.gold -= this.BUILD_COST;
-    tiles[tileKey].building = 'barracks';
-    tiles[tileKey].spawnTimer = 0;
-    return { success: true };
-  },
-
-  // 100ms tick：更新兵营产出计时器，达到间隔时产出单位
-  tick(tiles, owner, enemyBaseKey) {
-    const spawnedUnits = [];
-    for (const key of Object.keys(tiles)) {
-      const tile = tiles[key];
-      if (tile.building === 'barracks' && tile.owner === owner) {
-        tile.spawnTimer = (tile.spawnTimer || 0) + 100;
-        if (tile.spawnTimer >= this.SPAWN_INTERVAL) {
-          tile.spawnTimer = 0;
-          const unitType = this.randomUnitType();
-          const unit = {
-            type: unitType,
-            ...UNIT_TYPES[unitType],
-            currentHp: UNIT_TYPES[unitType].hp,
-            owner: owner,
-            tileKey: key,
-            q: tile.q,
-            r: tile.r
-          };
-          spawnedUnits.push(unit);
-        }
-      }
-    }
-    return spawnedUnits;
-  },
-
-  // 随机兵种类型（等概率）
-  randomUnitType() {
-    const types = Object.keys(UNIT_TYPES);
-    return types[Math.floor(Math.random() * types.length)];
+  for (let q = 0; q < 9; q++) {
+    console.assert(HexGrid.isLake(q, 6) === true, `(${q},6) 应为湖水`)
   }
-};
+  console.assert(HexGrid.isLake(0, 0) === false, '(0,0) 不是湖水')
+  console.assert(HexGrid.isLake(4, 12) === false, 'HQ 所在行不是湖水')
+  console.assert(HexGrid.isLake(0, 7) === false, '(0,7) 不是湖水')
 
-// ============================================================
-// AIBehavior: AI 决策逻辑（翻牌、建兵营）
-// ============================================================
-const AIBehavior = {
-  REVEAL_INTERVAL: 2000,  // 每 2 秒翻牌
-  BUILD_CHECK_INTERVAL: 5000, // 每 5 秒检查建兵营
-  FRONTLINE_THRESHOLD: 3, // 前线兵力 < 3 时建兵营
-
-  // 内部计时状态
-  revealTimer: 0,
-  buildCheckTimer: 0,
-
-  // 主 tick：每 100ms 调用，推进计时器并执行决策
-  tick(state, dt = 100) {
-    this.revealTimer += dt;
-    this.buildCheckTimer += dt;
-
-    if (this.revealTimer >= this.REVEAL_INTERVAL) {
-      this.revealTimer = 0;
-      this.tryRevealNearest(state);
-    }
-
-    if (this.buildCheckTimer >= this.BUILD_CHECK_INTERVAL) {
-      this.buildCheckTimer = 0;
-      this.tryBuildBarracks(state);
-    }
-  },
-
-  // AI 翻牌：找离 AI 基地最近的未翻开格子
-  tryRevealNearest(state) {
-    if (state.aiResources.gold < ResourceSystem.REVEAL_COST) return;
-
-    const [baseQ, baseR] = state.aiBase.split(',').map(Number);
-    let nearestKey = null;
-    let nearestDist = Infinity;
-
-    for (const key of Object.keys(state.tiles)) {
-      const tile = state.tiles[key];
-      if (tile.revealed) continue;
-
-      // 曼哈顿距离（axial 坐标）
-      const dist = Math.abs(tile.q - baseQ) + Math.abs(tile.r - baseR);
-      if (dist < nearestDist) {
-        nearestDist = dist;
-        nearestKey = key;
-      }
-    }
-
-    if (!nearestKey) return;
-
-    const revealResult = ResourceSystem.tryReveal(state.aiResources);
-    if (!revealResult.success) return;
-
-    const result = TileReveal.reveal(nearestKey, state.tiles);
-    if (result.success && result.tileType === 'mine') {
-      ResourceSystem.onMineRevealed(state.aiResources);
-    }
-  },
-
-  // AI 建兵营：前线兵力 < 3 时在己方空地建
-  tryBuildBarracks(state) {
-    if (state.aiResources.gold < BarracksSystem.BUILD_COST) return;
-
-    const frontlineCount = this.countFrontlineUnits(state, 'ai');
-    if (frontlineCount >= this.FRONTLINE_THRESHOLD) return;
-
-    // 找一个己方空地且无兵营的格子
-    for (const key of Object.keys(state.tiles)) {
-      const tile = state.tiles[key];
-      if (tile.revealed && tile.type === 'empty' && tile.owner === 'ai' && tile.building !== 'barracks') {
-        BarracksSystem.tryBuild(state.aiResources, tile, key, state.tiles, 'ai');
-        return;
-      }
-    }
-  },
-
-  // 统计前线单位数量（己方单位在已占领格子上的数量）
-  countFrontlineUnits(state, owner) {
-    return state.units.filter(u => u.owner === owner && u.currentHp > 0).length;
-  }
-};
-
-// ============================================================
-// Embedded assertions: ResourceSystem gold management
-// ============================================================
-(function testResourceSystem() {
-  // 测试初始状态
-  const res = ResourceSystem.create(50);
-  console.assert(res.gold === 50, `Initial gold should be 50, got ${res.gold}`);
-  console.assert(res.mineCount === 0, `Initial mine count should be 0, got ${res.mineCount}`);
-
-  // 测试翻牌消耗
-  const revealResult = ResourceSystem.tryReveal(res);
-  console.assert(revealResult.success === true, 'tryReveal with enough gold should succeed');
-  console.assert(res.gold === 40, `Gold should be 40 after reveal, got ${res.gold}`);
-
-  // 测试金币不足
-  const res2 = ResourceSystem.create(5);
-  const failResult = ResourceSystem.tryReveal(res2);
-  console.assert(failResult.success === false, 'tryReveal with insufficient gold should fail');
-  console.assert(failResult.reason === 'not enough gold', 'Fail reason should be "not enough gold"');
-  console.assert(res2.gold === 5, 'Gold should not change on failed reveal');
-
-  // 测试金矿翻出：立即 +50 + 记录矿数
-  const res3 = ResourceSystem.create(50);
-  ResourceSystem.onMineRevealed(res3);
-  console.assert(res3.gold === 100, `Gold after mine should be 100, got ${res3.gold}`);
-  console.assert(res3.mineCount === 1, `Mine count should be 1, got ${res3.mineCount}`);
-
-  // 测试多个金矿叠加
-  ResourceSystem.onMineRevealed(res3);
-  console.assert(res3.gold === 150, `Gold after 2nd mine should be 150, got ${res3.gold}`);
-  console.assert(res3.mineCount === 2, `Mine count should be 2, got ${res3.mineCount}`);
-
-  // 测试 1Hz tick 产出
-  const res4 = ResourceSystem.create(0);
-  ResourceSystem.onMineRevealed(res4); // 1 mine
-  const income1 = ResourceSystem.tick(res4);
-  console.assert(income1 === 5, `Tick income with 1 mine should be 5, got ${income1}`);
-  console.assert(res4.gold === 55, `Gold after tick should be 55 (50+5), got ${res4.gold}`);
-
-  // 测试多金矿叠加产出（直接修改 mineCount 模拟已有 2 矿）
-  res4.mineCount = 2;
-  const income2 = ResourceSystem.tick(res4);
-  console.assert(income2 === 10, `Tick income with 2 mines should be 10, got ${income2}`);
-
-  // 测试无金矿时 tick 不产出
-  const res5 = ResourceSystem.create(100);
-  const income0 = ResourceSystem.tick(res5);
-  console.assert(income0 === 0, `Tick income with 0 mines should be 0, got ${income0}`);
-  console.assert(res5.gold === 100, `Gold should not change with 0 mines, got ${res5.gold}`);
-
-  console.log('[test] ResourceSystem tests passed');
-})();
-
-// ============================================================
-// Embedded assertions: BarracksSystem build and spawn
-// ============================================================
-(function testBarracksSystem() {
-  // 测试在空地建造兵营
-  const tiles = {
-    '0,0': { q: 0, r: 0, type: 'empty', owner: 'player', revealed: true, building: undefined },
-    '1,0': { q: 1, r: 0, type: 'mine', owner: 'player', revealed: true, building: undefined },
-    '2,0': { q: 2, r: 0, type: 'empty', owner: 'neutral', revealed: true, building: undefined }
-  };
-  const res = ResourceSystem.create(50);
-
-  const result1 = BarracksSystem.tryBuild(res, tiles['0,0'], '0,0', tiles, 'player');
-  console.assert(result1.success === true, 'Build barracks on owned empty tile should succeed');
-  console.assert(res.gold === 10, `Gold should be 10 after build (50-40), got ${res.gold}`);
-  console.assert(tiles['0,0'].building === 'barracks', 'Tile should have barracks after build');
-
-  // 测试非空地不能建造
-  const res2 = ResourceSystem.create(50);
-  const result2 = BarracksSystem.tryBuild(res2, tiles['1,0'], '1,0', tiles, 'player');
-  console.assert(result2.success === false, 'Build on mine should fail');
-  console.assert(res2.gold === 50, 'Gold should not change on failed build');
-
-  // 测试非己方领地不能建造
-  const result3 = BarracksSystem.tryBuild(res2, tiles['2,0'], '2,0', tiles, 'player');
-  console.assert(result3.success === false, 'Build on neutral tile should fail');
-
-  // 测试已有兵营不能重复建造
-  const res3 = ResourceSystem.create(50);
-  const result4 = BarracksSystem.tryBuild(res3, tiles['0,0'], '0,0', tiles, 'player');
-  console.assert(result4.success === false, 'Build on existing barracks should fail');
-
-  // 测试金币不足
-  const res4 = ResourceSystem.create(30);
-  const emptyTile = { q: 3, r: 0, type: 'empty', owner: 'player', revealed: true, building: undefined };
-  tiles['3,0'] = emptyTile;
-  const result5 = BarracksSystem.tryBuild(res4, emptyTile, '3,0', tiles, 'player');
-  console.assert(result5.success === false, 'Build with insufficient gold should fail');
-
-  // 测试随机兵种生成
-  const unitType = BarracksSystem.randomUnitType();
-  console.assert(UNIT_TYPES[unitType] !== undefined, `Random unit type should be valid, got ${unitType}`);
-
-  // 测试兵营 tick 产出单位
-  const barracksTile = { q: 0, r: 0, type: 'empty', owner: 'player', revealed: true, building: 'barracks', spawnTimer: 0 };
-  const testTiles = { '0,0': barracksTile };
-
-  // 模拟 30 次 tick（3 秒 = 30 × 100ms），第 30 次 tick 时 spawnTimer 达到 3000
-  for (let i = 0; i < 30; i++) {
-    const units2 = BarracksSystem.tick(testTiles, 'player', '2,6');
-    if (i < 29) {
-      console.assert(units2.length === 0, `No units before 30th tick, got ${units2.length} at tick ${i}`);
-    } else {
-      console.assert(units2.length === 1, `Should spawn 1 unit at 30th tick, got ${units2.length}`);
-      const unit = units2[0];
-      console.assert(unit.owner === 'player', 'Unit owner should be player');
-      console.assert(unit.currentHp > 0, 'Unit HP should be positive');
-      console.assert(UNIT_TYPES[unit.type] !== undefined, 'Unit type should be valid');
+  // 2. axialToPixel / pixelToAxial 互逆（所有非湖水格子）
+  for (let r = 0; r < 13; r++) {
+    if (r === 6) continue
+    for (let q = 0; q < 9; q++) {
+      const px = HexGrid.axialToPixel(q, r)
+      const back = HexGrid.pixelToAxial(px.x, px.y)
+      console.assert(back.q === q && back.r === r,
+        `互逆失败 (${q},${r}) → px(${px.x.toFixed(1)},${px.y.toFixed(1)}) → (${back.q},${back.r})`)
     }
   }
 
-  console.log('[test] BarracksSystem tests passed');
-})();
+  // 3. 原点与湖水两侧 y 间隔
+  const p00 = HexGrid.axialToPixel(0, 0)
+  console.assert(p00.x === 0 && p00.y === 0, 'axialToPixel(0,0) 应为 (0,0)')
+  const y5 = HexGrid.axialToPixel(0, 5).y
+  const y7 = HexGrid.axialToPixel(0, 7).y
+  console.assert(y7 - y5 > HexGrid.hexSize * 2,
+    `湖水两侧 y 间距应大于 2*size，实际 ${(y7 - y5).toFixed(1)}`)
 
-// ============================================================
-// Embedded assertions: AIBehavior reveal and build logic
-// ============================================================
-(function testAIBehavior() {
-  // --- 测试 1: AI 翻牌最近未翻开格子 ---
-  const aiState1 = {
-    aiBase: '2,6',
-    aiResources: ResourceSystem.create(50),
-    tiles: {
-      '2,6': { q: 2, r: 6, type: 'base', owner: 'ai', revealed: true },
-      '0,0': { q: 0, r: 0, type: 'mine', owner: 'neutral', revealed: false },
-      '1,5': { q: 1, r: 5, type: 'empty', owner: 'neutral', revealed: false },
-      '3,5': { q: 3, r: 5, type: 'monster', owner: 'neutral', revealed: false }
-    },
-    units: []
-  };
+  // 4. getNeighbors：越界与湖水过滤
+  const corner = HexGrid.getNeighbors(0, 0)
+  console.assert(corner.length === 3, `角落 (0,0) 应有 3 个邻居，实际 ${corner.length}`)
+  console.assert(corner.every(n => HexGrid.isInBounds(n.q, n.r)), '角落邻居不应越界')
 
-  // 重置 AI 计时器
-  AIBehavior.revealTimer = 0;
-  AIBehavior.buildCheckTimer = 0;
+  const edge = HexGrid.getNeighbors(0, 3)
+  console.assert(edge.length === 3, `左边缘 (0,3) 应有 3 个邻居，实际 ${edge.length}`)
 
-  // 推进 2 秒，触发翻牌
-  AIBehavior.tick(aiState1, 2000);
-  // (1,5) 距离 AI 基地 (2,6) 最近（曼哈顿距离 2），应该被翻牌
-  console.assert(aiState1.tiles['1,5'].revealed === true, 'AI should reveal nearest fog tile');
-  console.assert(aiState1.aiResources.gold === 40, `AI gold should be 40 after reveal (50-10), got ${aiState1.aiResources.gold}`);
+  const mid = HexGrid.getNeighbors(4, 3)
+  console.assert(mid.length === 6, `中央 (4,3) 应有 6 个邻居，实际 ${mid.length}`)
 
-  // --- 测试 2: AI 金币不足时不翻牌 ---
-  const aiState2 = {
-    aiBase: '2,6',
-    aiResources: ResourceSystem.create(5),
-    tiles: {
-      '2,6': { q: 2, r: 6, type: 'base', owner: 'ai', revealed: true },
-      '1,5': { q: 1, r: 5, type: 'empty', owner: 'neutral', revealed: false }
-    },
-    units: []
-  };
-  AIBehavior.revealTimer = 0;
-  AIBehavior.tick(aiState2, 2000);
-  console.assert(aiState2.tiles['1,5'].revealed === false, 'AI should not reveal when gold < 10');
-  console.assert(aiState2.aiResources.gold === 5, 'AI gold should not change');
+  const nearLakeEven = HexGrid.getNeighbors(4, 5)
+  console.assert(nearLakeEven.length === 4,
+    `湖前偶数行 (4,5) 应有 4 个邻居，实际 ${nearLakeEven.length}`)
+  console.assert(nearLakeEven.every(n => !HexGrid.isLake(n.q, n.r)), '湖前邻居不应含湖水')
 
-  // --- 测试 3: AI 建兵营（前线兵力 < 3） ---
-  const aiState3 = {
-    aiBase: '2,6',
-    aiResources: ResourceSystem.create(50),
-    tiles: {
-      '2,6': { q: 2, r: 6, type: 'base', owner: 'ai', revealed: true },
-      '1,6': { q: 1, r: 6, type: 'empty', owner: 'ai', revealed: true, building: undefined }
-    },
-    units: []
-  };
-  AIBehavior.revealTimer = 0;
-  AIBehavior.buildCheckTimer = 0;
+  const nearLakeOdd = HexGrid.getNeighbors(4, 7)
+  console.assert(nearLakeOdd.length === 4,
+    `湖后奇数行 (4,7) 应有 4 个邻居，实际 ${nearLakeOdd.length}`)
 
-  // 推进 5 秒，触发建兵营检查
-  AIBehavior.tick(aiState3, 5000);
-  // 前线 0 兵力 < 3，应该建兵营
-  console.assert(aiState3.aiResources.gold === 10, `AI gold should be 10 after build (50-40), got ${aiState3.aiResources.gold}`);
-  console.assert(aiState3.tiles['1,6'].building === 'barracks', 'AI should build barracks on empty tile');
+  const lakeNeighbors = HexGrid.getNeighbors(4, 6)
+  console.assert(lakeNeighbors.length === 0, `湖水格 (4,6) 应返回 0 个邻居，实际 ${lakeNeighbors.length}`)
 
-  // --- 测试 4: AI 前线兵力 >= 3 时不建兵营 ---
-  const aiState4 = {
-    aiBase: '2,6',
-    aiResources: ResourceSystem.create(50),
-    tiles: {
-      '2,6': { q: 2, r: 6, type: 'base', owner: 'ai', revealed: true },
-      '1,6': { q: 1, r: 6, type: 'empty', owner: 'ai', revealed: true, building: undefined }
-    },
-    units: [
-      { type: 'infantry', hp: 220, atk: 15, currentHp: 220, owner: 'ai', tileKey: '2,6', q: 2, r: 6 },
-      { type: 'cavalry', hp: 180, atk: 18, currentHp: 180, owner: 'ai', tileKey: '2,6', q: 2, r: 6 },
-      { type: 'archer', hp: 120, atk: 20, currentHp: 120, owner: 'ai', tileKey: '2,6', q: 2, r: 6 }
-    ]
-  };
-  AIBehavior.revealTimer = 0;
-  AIBehavior.buildCheckTimer = 0;
-  AIBehavior.tick(aiState4, 5000);
-  console.assert(aiState4.aiResources.gold === 50, 'AI should not build barracks when frontline >= 3');
-  console.assert(aiState4.tiles['1,6'].building !== 'barracks', 'No barracks should be built');
+  const cornerTopRight = HexGrid.getNeighbors(8, 0)
+  console.assert(cornerTopRight.every(n => n.q <= 8 && n.r >= 0),
+    '右上角落邻居不应越界')
 
-  // --- 测试 5: countFrontlineUnits 正确统计 ---
-  const countState = {
-    units: [
-      { type: 'infantry', hp: 220, currentHp: 220, owner: 'ai' },
-      { type: 'cavalry', hp: 180, currentHp: 0, owner: 'ai' }, // 死亡
-      { type: 'archer', hp: 120, currentHp: 120, owner: 'player' }
-    ]
-  };
-  console.assert(AIBehavior.countFrontlineUnits(countState, 'ai') === 1, 'Should count only alive AI units');
-  console.assert(AIBehavior.countFrontlineUnits(countState, 'player') === 1, 'Should count player units');
+  // 5. findHexAt：命中精度 + 湖水无反应
+  for (let r = 0; r < 13; r++) {
+    if (r === 6) continue
+    for (let q = 0; q < 9; q++) {
+      const px = HexGrid.axialToPixel(q, r)
+      const hit = HexGrid.findHexAt(px.x, px.y)
+      console.assert(hit && hit.q === q && hit.r === r,
+        `findHexAt 中心命中失败 (${q},${r})`)
+    }
+  }
 
-  console.log('[test] AIBehavior tests passed');
-})();
+  const oobBottom = HexGrid.findHexAt(100, 600)
+  console.assert(oobBottom === null, '点击画布下方远处应返回 null（越界）')
 
-// ============================================================
-// Embedded assertions: Unit movement and tile claiming
-// ============================================================
-(function testUnitMovement() {
-  const state = {
-    tiles: {
-      '0,0': { q: 0, r: 0, type: 'empty', owner: 'player', revealed: true },
-      '1,0': { q: 1, r: 0, type: 'empty', owner: 'neutral', revealed: true },
-      '2,0': { q: 2, r: 0, type: 'empty', owner: 'neutral', revealed: true }
-    },
-    units: [
-      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '0,0', q: 0, r: 0 }
-    ],
-    aiBase: '2,0',
-    playerBase: '0,0'
-  };
+  const oobRight = HexGrid.findHexAt(1200, 200)
+  console.assert(oobRight === null, '点击画布右侧远处应返回 null（越界）')
 
-  // 初始单位在 (0,0)
-  console.assert(state.units[0].q === 0, 'Unit should start at q=0');
-  console.assert(state.units[0].r === 0, 'Unit should start at r=0');
+  // 边界像素：略微偏移仍命中正确格
+  const p = HexGrid.axialToPixel(4, 3)
+  const offset = HexGrid.hexSize * 0.3
+  const near = HexGrid.findHexAt(p.x + offset, p.y + offset)
+  console.assert(near && near.q === 4 && near.r === 3,
+    `中心 30% 偏移应仍命中 (4,3)，实际 (${near && near.q},${near && near.r})`)
 
-  moveUnits(state);
-
-  // 移动后单位应该到了 (1,0)（中立格子被占领）
-  console.assert(state.units[0].q === 1, `Unit should move to q=1, got ${state.units[0].q}`);
-  console.assert(state.units[0].r === 0, `Unit r should be 0, got ${state.units[0].r}`);
-  console.assert(state.tiles['1,0'].owner === 'player', 'Neutral tile should be claimed by player');
-
-  moveUnits(state);
-
-  // 再移动到 (2,0)
-  console.assert(state.units[0].q === 2, `Unit should move to q=2, got ${state.units[0].q}`);
-  console.assert(state.tiles['2,0'].owner === 'player', 'Enemy-adjacent tile should be claimed');
-
-  // 测试死亡单位被清理
-  state.units.push({ type: 'cavalry', name: '骑兵', hp: 180, atk: 18, currentHp: 0, owner: 'ai', tileKey: '0,0', q: 0, r: 0 });
-  moveUnits(state);
-  const aliveUnits = state.units.filter(u => u.currentHp > 0);
-  console.assert(state.units.length === aliveUnits.length, 'Dead units should be removed after moveUnits');
-
-  // 测试占领敌方格子：玩家单位移动到 AI 拥有的格子
-  const enemyState = {
-    tiles: {
-      '0,0': { q: 0, r: 0, type: 'base', owner: 'player', revealed: true },
-      '1,0': { q: 1, r: 0, type: 'empty', owner: 'ai', revealed: true }
-    },
-    units: [
-      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '0,0', q: 0, r: 0 }
-    ],
-    aiBase: '1,0',
-    playerBase: '0,0'
-  };
-  moveUnits(enemyState);
-  console.assert(enemyState.units[0].tileKey === '1,0', 'Player unit should move onto AI base tile');
-  console.assert(enemyState.tiles['1,0'].owner === 'player', 'AI base tile should be claimed by player after unit enters');
-  console.assert(enemyState.units[0].tileKey === enemyState.aiBase, 'Unit tileKey should match aiBase key');
-
-  console.log('[test] Unit movement tests passed');
-})();
-
-// ============================================================
-// Embedded assertions: CombatSystem counter damage
-// ============================================================
-(function testCombatDamage() {
-  // 步兵克制骑兵：步兵 ATK 15 × 1.5 = 22
-  const infantry = { type: 'infantry', atk: 15 };
-  const cavalry = { type: 'cavalry', atk: 18 };
-  const archer = { type: 'archer', atk: 20 };
-
-  console.assert(getCounterMultiplier(infantry, cavalry) === 1.5, 'Infantry vs cavalry should be ×1.5 (counter)');
-  console.assert(getCounterMultiplier(cavalry, infantry) === 0.5, 'Cavalry vs infantry should be ×0.5 (countered)');
-  console.assert(getCounterMultiplier(infantry, infantry) === 1.0, 'Infantry vs infantry should be ×1.0 (no counter)');
-
-  // 骑兵克制弓箭手
-  console.assert(getCounterMultiplier(cavalry, archer) === 1.5, 'Cavalry vs archer should be ×1.5 (counter)');
-  console.assert(getCounterMultiplier(archer, cavalry) === 0.5, 'Archer vs cavalry should be ×0.5 (countered)');
-
-  // 弓箭手克制步兵
-  console.assert(getCounterMultiplier(archer, infantry) === 1.5, 'Archer vs infantry should be ×1.5 (counter)');
-  console.assert(getCounterMultiplier(infantry, archer) === 0.5, 'Infantry vs archer should be ×0.5 (countered)');
-
-  // 实际伤害计算
-  console.assert(calcDamage(infantry, cavalry) === 23, `Infantry vs cavalry damage should be 23 (15*1.5=22.5→23), got ${calcDamage(infantry, cavalry)}`);
-  console.assert(calcDamage(cavalry, infantry) === 9, `Cavalry vs infantry damage should be 9 (18*0.5), got ${calcDamage(cavalry, infantry)}`);
-  console.assert(calcDamage(archer, infantry) === 30, `Archer vs infantry damage should be 30 (20*1.5), got ${calcDamage(archer, infantry)}`);
-  console.assert(calcDamage(infantry, archer) === 8, `Infantry vs archer damage should be 8 (15*0.5=7.5→8), got ${calcDamage(infantry, archer)}`);
-
-  // 测试相邻单位交战
-  const state = {
-    tiles: {
-      '0,0': { q: 0, r: 0, owner: 'player', revealed: true },
-      '1,0': { q: 1, r: 0, owner: 'ai', revealed: true }
-    },
-    units: [
-      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '0,0', q: 0, r: 0 },
-      { type: 'cavalry', name: '骑兵', hp: 180, atk: 18, currentHp: 180, owner: 'ai', tileKey: '1,0', q: 1, r: 0 }
-    ]
-  };
-
-  combatTick(state);
-
-  // 步兵克制骑兵，受到骑兵 9 点伤害，骑兵受到步兵 22 点伤害
-  console.assert(state.units[0].currentHp === 211, `Player infantry should have 211 HP (220-9), got ${state.units[0].currentHp}`);
-  console.assert(state.units[1].currentHp === 157, `AI cavalry should have 157 HP (180-23), got ${state.units[1].currentHp}`);
-
-  // 测试非相邻单位不交战
-  const state2 = {
-    tiles: {
-      '0,0': { q: 0, r: 0, owner: 'player', revealed: true },
-      '3,0': { q: 3, r: 0, owner: 'ai', revealed: true }
-    },
-    units: [
-      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '0,0', q: 0, r: 0 },
-      { type: 'cavalry', name: '骑兵', hp: 180, atk: 18, currentHp: 180, owner: 'ai', tileKey: '3,0', q: 3, r: 0 }
-    ]
-  };
-
-  combatTick(state2);
-  console.assert(state2.units[0].currentHp === 220, 'Non-adjacent units should not take damage');
-  console.assert(state2.units[1].currentHp === 180, 'Non-adjacent units should not take damage');
-
-  // 测试同阵营单位不交战
-  const state3 = {
-    tiles: {
-      '0,0': { q: 0, r: 0, owner: 'player', revealed: true },
-      '1,0': { q: 1, r: 0, owner: 'player', revealed: true }
-    },
-    units: [
-      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '0,0', q: 0, r: 0 },
-      { type: 'cavalry', name: '骑兵', hp: 180, atk: 18, currentHp: 180, owner: 'player', tileKey: '1,0', q: 1, r: 0 }
-    ]
-  };
-
-  combatTick(state3);
-  console.assert(state3.units[0].currentHp === 220, 'Same-faction units should not fight');
-  console.assert(state3.units[1].currentHp === 180, 'Same-faction units should not fight');
-
-  console.log('[test] Combat damage tests passed');
-})();
-
-// ============================================================
-// Embedded assertions: Victory/defeat detection
-// ============================================================
-(function testCheckVictory() {
-  // 玩家单位在 AI 大本营 → 玩家胜利
-  const stateWin = {
-    playerBase: '2,0',
-    aiBase: '2,6',
-    units: [
-      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '2,6', q: 2, r: 6 }
-    ]
-  };
-  console.assert(checkVictory(stateWin) === 'player_win', 'Player unit on AI base should be player_win');
-
-  // AI 单位在玩家大本营 → 玩家失败
-  const stateLose = {
-    playerBase: '2,0',
-    aiBase: '2,6',
-    units: [
-      { type: 'cavalry', name: '骑兵', hp: 180, atk: 18, currentHp: 180, owner: 'ai', tileKey: '2,0', q: 2, r: 0 }
-    ]
-  };
-  console.assert(checkVictory(stateLose) === 'ai_win', 'AI unit on player base should be ai_win');
-
-  // 双方都不在对方大本营 → 无结果
-  const stateOngoing = {
-    playerBase: '2,0',
-    aiBase: '2,6',
-    units: [
-      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '1,0', q: 1, r: 0 },
-      { type: 'cavalry', name: '骑兵', hp: 180, atk: 18, currentHp: 180, owner: 'ai', tileKey: '1,6', q: 1, r: 6 }
-    ]
-  };
-  console.assert(checkVictory(stateOngoing) === null, 'No unit on enemy base should be null');
-
-  // 空单位列表 → 无结果
-  const stateEmpty = { playerBase: '2,0', aiBase: '2,6', units: [] };
-  console.assert(checkVictory(stateEmpty) === null, 'Empty units should be null');
-
-  console.log('[test] CheckVictory tests passed');
-})();
-
-// ============================================================
-// Embedded assertions for GameLoop behavior
-// ============================================================
-(function testGameLoop() {
-  console.assert(typeof createGameLoop === 'function', 'createGameLoop should be a function');
-  const mockLoop = createGameLoop(() => {});
-  console.assert(typeof mockLoop.start === 'function', 'loop should have start()');
-  console.assert(typeof mockLoop.stop === 'function', 'loop should have stop()');
-
-  // Verify loop actually ticks after 200ms (> 2 ticks at 10Hz)
-  setTimeout(() => {
-    console.assert(tickCount > 0, `GameLoop should be ticking, got tickCount=${tickCount}`);
-    console.log(`[test] GameLoop passed. tickCount=${tickCount}`);
-  }, 200);
-})();
+  console.log('[test] HexGrid v2 (9×12+lake) tests passed')
+})()
 </script>
-
 </body>
 </html>
