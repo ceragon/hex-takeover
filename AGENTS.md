@@ -133,15 +133,15 @@ initGameState() → main loop → UI/render → click handling → tests
 ## Known Pitfalls
 
 <!-- Keep updated, max ~8-9 entries -->
-- **v2 TerritorySystem.owners 是领地唯一权威源（tile.owner 不可信）：** `TerritorySystem.claim` 只写 `owners[hexId] = owner`，**不**回写 `tile.owner`。测试用 `{ owner: null, ... }` 字面量构造 tile 后 `TerritorySystem.claim('4,5', 'ai', ...)` 只更新字典，`tile.owner` 仍是 null。遍历 `Object.keys(tiles)` 读 `tile.owner` 会漏掉所有通过 claim 翻转的领地。**修复：所有领地归属判断与翻转（如 VictorySystem._flipAllTerritory）必须遍历 `TerritorySystem.owners` 字典，不能读 `tile.owner`**。渲染代码若需按 owner 着色，也要从 `TerritorySystem.owners[hexId]` 取（HQ 等直接设置 tile.owner 的场景除外）。
-- **v2 湖水格必须可通行（视觉装饰而非移动屏障）：** 六边形邻居只覆盖 ±1 行，若 `getNeighbors` 和 BFS 过滤 r=LAKE_ROW，地图上下两半完全断开，单位无法跨越。**修复：`getNeighbors` 不再过滤湖水格，BFS 不再跳过湖水，渲染保留蓝色视觉带**。
-- **v2 building.attackCd NaN 陷阱：** 建筑 attackCd 初始是 `undefined`，`Math.max(0, undefined - 1) = NaN`，之后 `NaN > 0` 为 false，导致箭塔/HQ 永远不攻击。**修复：递减前加双条件守卫 `if (tile.building.attackCd !== undefined && tile.building.attackCd > 0)`**；新建筑也可主动初始化 `attackCd: 0`。
+- **v2 TerritorySystem.claim 现在同时设置 tile.owner + flashTicks：** slice 9 起 `claim(hexId, owner, tiles, rng)` 在 `tiles` 存在时会设 `tile.owner = owner` 和 `tile.flashTicks = 3`（领地变更闪白过渡）。旧代码假设 claim 不改 tile.owner 已失效。**修复：若测试只传空对象 `{}` 作为 tiles，`tiles[hexId]` 是 undefined，安全跳过；但生产代码总会传完整 tiles 字典**。
 - **v2 resolveUnitAttack 金阶 mode 必须直接用 unit.mode：** 若先按距离算 `mode = dist > 1.2 ? 'ranged' : 'melee'` 再用 `if (gold) mode = unit.mode...` 覆盖，AOE 判断（`mode === 'ranged'`）会读错值。金阶分支**必须直接** `mode = unit.mode === 'melee' ? 'melee' : 'ranged'`，非金阶才走距离判断。
 - **v2 测试 IIFE 污染全局 gameState：** 每个测试的 `resetAll()` 调用各系统 `.init()` 清空全局状态（如 `BarracksSystem.init()` 清空 timers，把 `initGameState()` 注册的兵营全删掉，游戏循环永不吐兵）。**修复：所有测试 IIFE 执行完后 `gameState = initGameState()` 重新初始化**。
 - **v2 HQ 摧毁必须绕过 RuinSystem + 触发 VictorySystem：** `CombatSystem._destroyBuilding` 对所有 hp≤0 的建筑调用 `RuinSystem.createRuin`，但 HQ 摧毁意味着游戏立即结束，不需要废墟生命周期（且废墟格会破坏波浪翻色逻辑）。**修复：在 `_destroyBuilding` 顶部加 `if (tile.building.type === 'hq') { tile.building = null; return }` 早返回；在 `_cleanup` 中识别 `isHq` 并调用 `VictorySystem.startWave(attacker, hexId, tiles)` 而非 `TerritorySystem.claim`**。
 - **v2 AIBehavior.tick 必须传 inner action 而非 wrapper 给 executeAction：** `pendingAction = { action, executeAt }` 是 wrapper，`executeAction` 期望的是 inner action `{ type, tile, cost }`。若误写 `this.executeAction(this._pendingAction, ...)`，内部 `const { tile } = action` 解构出 undefined，所有后续 tile 操作静默失败（early-return），AI 永远不动。**修复：`this.executeAction(this._pendingAction.action, tiles, rng)`**。
 - **v2 SeededRNG.init(seed) 必须返回 `this` 支持链式：** 测试/模块里常用 `rng = SeededRNG.init(seed)` 捕获实例。若 init 不返回 this，`rng` 是 undefined，噪声分支 `rng.nextFloat()` 崩溃。**修复：init 末尾 `return this`**。注意：SeededRNG 是单例，多 `init(seed)` 调用都返回同一对象——若需并行多 RNG 流（如 AI 独立噪声），必须自己构造独立实例而非复用 SeededRNG。
 - **v2 AI 打分必须难度感知（normal vs hard 用不同公式）：** 升级打分若用单一公式（如金矿 base 30 / 箭塔 base 15+5·enemy），普通档在前线压力下仍会算出箭塔 > 金矿，破坏"普通档只升金矿"的 AC。**修复：普通档箭塔用低权重（8+2·enemy），困难档用高权重（15+5·enemy）；金矿 base 足够高（40 cap 20）使回本期分数稳定**。打分函数里 `if (this._difficulty === 'hard')` 分支决定公式。
+- **v2 VictorySystem.startWave 立即设 gameOver，但波浪动画仍能播放：** `startWave` 内 `this.gameOver = { winner, reason }` 立即执行，但 `tick()` 先检查 `if (this.wave)` 再检查 `if (this.gameOver)`，波浪存在时跳过 gameOver 短路。**注意：不要在 wave 活跃期额外检查 gameOver 来阻止波浪推进**。波浪在 WAVE_TICKS 后自清，此后 gameOver 才真正阻止后续 tick。
+- **v2 Node 提取 IIFE 测试必须用括号深度计数器定位结尾：** 从 HTML 提取 `(function testXxx(){...})()` 时，字符串搜索 `})()` 不可靠（注释或字符串里可能出现同样字符）。**修复：从左括号开始计数深度，depth=0 且下一字符是 `)` 时定位结尾；写临时 .js 文件执行，避免模板字符串与测试代码反引号冲突**。
 
 ## Core Numbers
 
