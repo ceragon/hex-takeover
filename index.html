@@ -217,6 +217,66 @@ const ResourceSystem = {
 };
 
 // ============================================================
+// Unit movement: move toward enemy base, claim neutral tiles
+// ============================================================
+function moveUnits(state) {
+  const enemyBaseFor = {
+    player: state.aiBase,
+    ai: state.playerBase
+  };
+
+  // 按单位分组（同一格子多个单位只移动一次）
+  const moved = new Set();
+
+  for (const unit of state.units) {
+    if (unit.currentHp <= 0) continue;
+    const unitId = `${unit.type}-${unit.tileKey}-${unit.owner}`;
+    if (moved.has(unitId)) continue;
+    moved.add(unitId);
+
+    const targetBase = enemyBaseFor[unit.owner];
+    const [targetQ, targetR] = targetBase.split(',').map(Number);
+
+    // 计算向目标方向的一步移动（axial 坐标差）
+    const dq = Math.sign(targetQ - unit.q);
+    const dr = Math.sign(targetR - unit.r);
+
+    // 尝试移动到的下一个格子
+    let nextQ = unit.q + dq;
+    let nextR = unit.r + dr;
+
+    // 如果某个方向已对齐，只移动另一个方向
+    if (targetQ === unit.q) nextQ = unit.q;
+    if (targetR === unit.r) nextR = unit.r;
+
+    // 边界检查
+    nextQ = Math.max(0, Math.min(MAP_COLS - 1, nextQ));
+    nextR = Math.max(0, Math.min(MAP_ROWS - 1, nextR));
+
+    if (nextQ === unit.q && nextR === unit.r) continue; // 已在目标或无法移动
+
+    const nextKey = `${nextQ},${nextR}`;
+    const nextTile = state.tiles[nextKey];
+
+    if (nextTile && nextTile.revealed && nextTile.owner === 'neutral') {
+      // 占领中立格子
+      nextTile.owner = unit.owner;
+      unit.tileKey = nextKey;
+      unit.q = nextQ;
+      unit.r = nextR;
+    } else if (nextTile && nextTile.revealed && nextTile.owner !== unit.owner) {
+      // 移动到敌方/已有单位格子（暂不处理战斗，只移动）
+      unit.tileKey = nextKey;
+      unit.q = nextQ;
+      unit.r = nextR;
+    }
+  }
+
+  // 清理死亡单位
+  state.units = state.units.filter(u => u.currentHp > 0);
+}
+
+// ============================================================
 // Embedded assertions: HexGrid coordinate generation
 // ============================================================
 (function testHexGrid() {
@@ -283,6 +343,7 @@ function initGameState() {
     playerResources: ResourceSystem.create(50),
     aiResources: ResourceSystem.create(50),
     lastIncomeTime: 0,
+    units: [],
     ...map
   };
 }
@@ -377,11 +438,47 @@ function renderGrid() {
       const labels = { mine: '金矿', empty: '空地', monster: '野怪', special: '特殊', base: '大本营' };
       drawHexLabel(cx, cy, labels[tile.type] || '', 9);
     }
+
+    // 兵营标识
+    if (tile.building === 'barracks') {
+      drawHexLabel(cx, cy - 10, '兵营', 8, '#ffff00');
+    }
+  }
+}
+
+// 绘制单位
+function renderUnits() {
+  if (!gameState || !gameState.units) return;
+  const size = HexGrid.hexSize;
+  const offsetX = 100;
+  const offsetY = 100;
+
+  for (const unit of gameState.units) {
+    const { x, y } = HexGrid.hexToPixel(unit.q, unit.r, size);
+    const cx = x + offsetX;
+    const cy = y + offsetY;
+
+    // 单位图标（兵种首字）
+    const icon = unit.name[0];
+    const color = unit.owner === 'player' ? '#66aaff' : '#ff6666';
+    drawHexLabel(cx, cy + 10, icon, 11, color);
+
+    // 血条
+    const hpRatio = unit.currentHp / unit.hp;
+    const barWidth = 20;
+    const barHeight = 3;
+    const barX = cx - barWidth / 2;
+    const barY = cy + 16;
+    ctx.fillStyle = '#333';
+    ctx.fillRect(barX, barY, barWidth, barHeight);
+    ctx.fillStyle = hpRatio > 0.5 ? '#4caf50' : hpRatio > 0.25 ? '#ff9800' : '#f44336';
+    ctx.fillRect(barX, barY, barWidth * hpRatio, barHeight);
   }
 }
 
 function render() {
   renderGrid();
+  renderUnits();
 }
 
 // ============================================================
@@ -397,25 +494,43 @@ canvas.addEventListener('click', (event) => {
 
   const tileKey = `${clickedHex.q},${clickedHex.r}`;
   const tile = gameState.tiles[tileKey];
-  if (!tile || tile.revealed) return;
+  if (!tile) return;
 
-  const revealResult = ResourceSystem.tryReveal(gameState.playerResources);
-  if (!revealResult.success) {
-    if (revealResult.reason === 'not enough gold') {
-      showNotification('金币不足！');
+  // 迷雾地块：翻牌
+  if (!tile.revealed) {
+    const revealResult = ResourceSystem.tryReveal(gameState.playerResources);
+    if (!revealResult.success) {
+      if (revealResult.reason === 'not enough gold') {
+        showNotification('金币不足！');
+      }
+      return;
     }
+
+    const result = TileReveal.reveal(tileKey, gameState.tiles);
+    if (result.success) {
+      if (result.tileType === 'mine') {
+        ResourceSystem.onMineRevealed(gameState.playerResources);
+      }
+    }
+    updateUI();
+    render();
     return;
   }
 
-  // 使用 TileReveal 标记已翻开
-  const result = TileReveal.reveal(tileKey, gameState.tiles);
-  if (result.success) {
-    if (result.tileType === 'mine') {
-      ResourceSystem.onMineRevealed(gameState.playerResources);
+  // 已翻开的空地：尝试建造兵营
+  if (tile.revealed && tile.type === 'empty' && tile.owner === 'player') {
+    const buildResult = BarracksSystem.tryBuild(gameState.playerResources, tile, tileKey, gameState.tiles, 'player');
+    if (buildResult.success) {
+      showNotification('兵营建造成功！');
+    } else if (buildResult.reason === 'not enough gold') {
+      showNotification('金币不足！');
+    } else if (buildResult.reason === 'already has barracks') {
+      showNotification('已有兵营！');
     }
+    updateUI();
+    render();
+    return;
   }
-  updateUI();
-  render();
 });
 
 // 查找鼠标位置对应的六边形（通过最近距离匹配）
@@ -481,12 +596,94 @@ const gameLoop = createGameLoop(() => {
     ResourceSystem.tick(gameState.aiResources);
   }
 
+  // 兵营每 100ms tick 产出单位
+  const playerUnits = BarracksSystem.tick(gameState.tiles, 'player', gameState.aiBase);
+  const aiUnits = BarracksSystem.tick(gameState.tiles, 'ai', gameState.playerBase);
+  if (playerUnits.length > 0 || aiUnits.length > 0) {
+    gameState.units = (gameState.units || []).concat(playerUnits, aiUnits);
+  }
+
+  // 单位移动：每 1Hz 移动一次（向敌方大本营方向）
+  if (tickCount % 10 === 0) {
+    moveUnits(gameState);
+  }
+
   render();
   renderNotification();
   updateUI();
 });
 
 gameLoop.start();
+
+// ============================================================
+// BarracksSystem: 兵营建造、单位产出调度
+// ============================================================
+const UNIT_TYPES = {
+  infantry:  { name: '步兵', hp: 220, atk: 15, counters: 'cavalry' },
+  cavalry:   { name: '骑兵', hp: 180, atk: 18, counters: 'archer' },
+  archer:    { name: '弓箭手', hp: 120, atk: 20, counters: 'infantry' }
+};
+
+const COUNTER_MULTIPLIER = 1.5;
+const BEING_COUNTERED_MULTIPLIER = 0.5;
+
+const BarracksSystem = {
+  BUILD_COST: 40,
+  SPAWN_INTERVAL: 3000, // 3 秒产出一个单位
+
+  // 尝试建造兵营：消耗金币，在空地格创建兵营
+  tryBuild(resources, tile, tileKey, tiles, owner) {
+    if (tile.type !== 'empty') {
+      return { success: false, reason: 'not empty tile' };
+    }
+    if (tile.owner !== owner) {
+      return { success: false, reason: 'not owned' };
+    }
+    if (tile.building === 'barracks') {
+      return { success: false, reason: 'already has barracks' };
+    }
+    if (resources.gold < this.BUILD_COST) {
+      return { success: false, reason: 'not enough gold' };
+    }
+
+    resources.gold -= this.BUILD_COST;
+    tiles[tileKey].building = 'barracks';
+    tiles[tileKey].spawnTimer = 0;
+    return { success: true };
+  },
+
+  // 100ms tick：更新兵营产出计时器，达到间隔时产出单位
+  tick(tiles, owner, enemyBaseKey) {
+    const spawnedUnits = [];
+    for (const key of Object.keys(tiles)) {
+      const tile = tiles[key];
+      if (tile.building === 'barracks' && tile.owner === owner) {
+        tile.spawnTimer = (tile.spawnTimer || 0) + 100;
+        if (tile.spawnTimer >= this.SPAWN_INTERVAL) {
+          tile.spawnTimer = 0;
+          const unitType = this.randomUnitType();
+          const unit = {
+            type: unitType,
+            ...UNIT_TYPES[unitType],
+            currentHp: UNIT_TYPES[unitType].hp,
+            owner: owner,
+            tileKey: key,
+            q: tile.q,
+            r: tile.r
+          };
+          spawnedUnits.push(unit);
+        }
+      }
+    }
+    return spawnedUnits;
+  },
+
+  // 随机兵种类型（等概率）
+  randomUnitType() {
+    const types = Object.keys(UNIT_TYPES);
+    return types[Math.floor(Math.random() * types.length)];
+  }
+};
 
 // ============================================================
 // Embedded assertions: ResourceSystem gold management
@@ -539,6 +736,113 @@ gameLoop.start();
   console.assert(res5.gold === 100, `Gold should not change with 0 mines, got ${res5.gold}`);
 
   console.log('[test] ResourceSystem tests passed');
+})();
+
+// ============================================================
+// Embedded assertions: BarracksSystem build and spawn
+// ============================================================
+(function testBarracksSystem() {
+  // 测试在空地建造兵营
+  const tiles = {
+    '0,0': { q: 0, r: 0, type: 'empty', owner: 'player', revealed: true, building: undefined },
+    '1,0': { q: 1, r: 0, type: 'mine', owner: 'player', revealed: true, building: undefined },
+    '2,0': { q: 2, r: 0, type: 'empty', owner: 'neutral', revealed: true, building: undefined }
+  };
+  const res = ResourceSystem.create(50);
+
+  const result1 = BarracksSystem.tryBuild(res, tiles['0,0'], '0,0', tiles, 'player');
+  console.assert(result1.success === true, 'Build barracks on owned empty tile should succeed');
+  console.assert(res.gold === 10, `Gold should be 10 after build (50-40), got ${res.gold}`);
+  console.assert(tiles['0,0'].building === 'barracks', 'Tile should have barracks after build');
+
+  // 测试非空地不能建造
+  const res2 = ResourceSystem.create(50);
+  const result2 = BarracksSystem.tryBuild(res2, tiles['1,0'], '1,0', tiles, 'player');
+  console.assert(result2.success === false, 'Build on mine should fail');
+  console.assert(res2.gold === 50, 'Gold should not change on failed build');
+
+  // 测试非己方领地不能建造
+  const result3 = BarracksSystem.tryBuild(res2, tiles['2,0'], '2,0', tiles, 'player');
+  console.assert(result3.success === false, 'Build on neutral tile should fail');
+
+  // 测试已有兵营不能重复建造
+  const res3 = ResourceSystem.create(50);
+  const result4 = BarracksSystem.tryBuild(res3, tiles['0,0'], '0,0', tiles, 'player');
+  console.assert(result4.success === false, 'Build on existing barracks should fail');
+
+  // 测试金币不足
+  const res4 = ResourceSystem.create(30);
+  const emptyTile = { q: 3, r: 0, type: 'empty', owner: 'player', revealed: true, building: undefined };
+  tiles['3,0'] = emptyTile;
+  const result5 = BarracksSystem.tryBuild(res4, emptyTile, '3,0', tiles, 'player');
+  console.assert(result5.success === false, 'Build with insufficient gold should fail');
+
+  // 测试随机兵种生成
+  const unitType = BarracksSystem.randomUnitType();
+  console.assert(UNIT_TYPES[unitType] !== undefined, `Random unit type should be valid, got ${unitType}`);
+
+  // 测试兵营 tick 产出单位
+  const barracksTile = { q: 0, r: 0, type: 'empty', owner: 'player', revealed: true, building: 'barracks', spawnTimer: 0 };
+  const testTiles = { '0,0': barracksTile };
+
+  // 模拟 30 次 tick（3 秒 = 30 × 100ms），第 30 次 tick 时 spawnTimer 达到 3000
+  for (let i = 0; i < 30; i++) {
+    const units2 = BarracksSystem.tick(testTiles, 'player', '2,6');
+    if (i < 29) {
+      console.assert(units2.length === 0, `No units before 30th tick, got ${units2.length} at tick ${i}`);
+    } else {
+      console.assert(units2.length === 1, `Should spawn 1 unit at 30th tick, got ${units2.length}`);
+      const unit = units2[0];
+      console.assert(unit.owner === 'player', 'Unit owner should be player');
+      console.assert(unit.currentHp > 0, 'Unit HP should be positive');
+      console.assert(UNIT_TYPES[unit.type] !== undefined, 'Unit type should be valid');
+    }
+  }
+
+  console.log('[test] BarracksSystem tests passed');
+})();
+
+// ============================================================
+// Embedded assertions: Unit movement and tile claiming
+// ============================================================
+(function testUnitMovement() {
+  const state = {
+    tiles: {
+      '0,0': { q: 0, r: 0, type: 'empty', owner: 'player', revealed: true },
+      '1,0': { q: 1, r: 0, type: 'empty', owner: 'neutral', revealed: true },
+      '2,0': { q: 2, r: 0, type: 'empty', owner: 'neutral', revealed: true }
+    },
+    units: [
+      { type: 'infantry', name: '步兵', hp: 220, atk: 15, currentHp: 220, owner: 'player', tileKey: '0,0', q: 0, r: 0 }
+    ],
+    aiBase: '2,0',
+    playerBase: '0,0'
+  };
+
+  // 初始单位在 (0,0)
+  console.assert(state.units[0].q === 0, 'Unit should start at q=0');
+  console.assert(state.units[0].r === 0, 'Unit should start at r=0');
+
+  moveUnits(state);
+
+  // 移动后单位应该到了 (1,0)（中立格子被占领）
+  console.assert(state.units[0].q === 1, `Unit should move to q=1, got ${state.units[0].q}`);
+  console.assert(state.units[0].r === 0, `Unit r should be 0, got ${state.units[0].r}`);
+  console.assert(state.tiles['1,0'].owner === 'player', 'Neutral tile should be claimed by player');
+
+  moveUnits(state);
+
+  // 再移动到 (2,0)
+  console.assert(state.units[0].q === 2, `Unit should move to q=2, got ${state.units[0].q}`);
+  console.assert(state.tiles['2,0'].owner === 'player', 'Enemy-adjacent tile should be claimed');
+
+  // 测试死亡单位被清理
+  state.units.push({ type: 'cavalry', name: '骑兵', hp: 180, atk: 18, currentHp: 0, owner: 'ai', tileKey: '0,0', q: 0, r: 0 });
+  moveUnits(state);
+  const aliveUnits = state.units.filter(u => u.currentHp > 0);
+  console.assert(state.units.length === aliveUnits.length, 'Dead units should be removed after moveUnits');
+
+  console.log('[test] Unit movement tests passed');
 })();
 
 // ============================================================
