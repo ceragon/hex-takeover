@@ -33,6 +33,16 @@
   <span id="player-gold" style="color:#6af;">己方金币: 60</span>
   <span id="ai-gold" style="color:#f66;">敌方金币: 60</span>
   <span id="territory-count" style="color:#aaa;">占领: 0/108</span>
+  <span id="difficulty-label" style="color:#9c9;">难度: 普通</span>
+</div>
+<div id="difficulty-overlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.85);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:10;font-family:monospace;color:#eee;">
+  <h1 style="margin-bottom:24px;color:#6af;">占城大师 v2</h1>
+  <p style="margin-bottom:32px;color:#aaa;">选择 AI 难度</p>
+  <div style="display:flex;gap:24px;">
+    <button id="btn-normal" style="padding:16px 32px;font-size:18px;font-family:monospace;background:#0f3460;color:#eee;border:2px solid #6af;cursor:pointer;">普通</button>
+    <button id="btn-hard" style="padding:16px 32px;font-size:18px;font-family:monospace;background:#601030;color:#eee;border:2px solid #f66;cursor:pointer;">困难</button>
+  </div>
+  <p style="margin-top:32px;color:#777;font-size:12px;max-width:400px;text-align:center;">普通：AI 从 top-3 动作随机选，适合上手。困难：AI 永远选最优动作，需发挥良好才能赢。</p>
 </div>
 
 <script>
@@ -179,6 +189,7 @@ const SeededRNG = {
     this.seed = seed
     this._state = seed | 0
     if (this._state === 0) this._state = 1
+    return this
   },
 
   next() {
@@ -1287,6 +1298,183 @@ const ClickHandler = {
 }
 
 // ============================================================
+// AIBehavior: 评分-选择算法（普通/困难两档，对等经济，无作弊）
+// ============================================================
+const AIBehavior = {
+  DECISION_CD: 15,
+  UPGRADE_EVAL_CD: 50,
+  REACTION_DELAY: 4,
+  SIDE: 'ai',
+
+  _rng: null,
+  _decisionTick: 0,
+  _upgradeTick: 0,
+  _pendingAction: null,
+  _tickCounter: 0,
+  _difficulty: 'normal',
+
+  init() {
+    this._rng = null
+    this._decisionTick = 0
+    this._upgradeTick = 0
+    this._pendingAction = null
+    this._tickCounter = 0
+    this._difficulty = 'normal'
+  },
+
+  setDifficulty(mode) {
+    if (mode === 'normal' || mode === 'hard') this._difficulty = mode
+  },
+
+  tick(tiles, rng) {
+    if (this._pendingAction) {
+      if (this._tickCounter >= this._pendingAction.executeAt) {
+        const action = this._pendingAction.action
+        this._pendingAction = null
+        this.executeAction(action, tiles, rng)
+      }
+    } else if (this._tickCounter >= this._decisionTick) {
+      if (!this._rng) this._rng = SeededRNG.init(12345)
+      const actions = this.enumerateActions(tiles)
+      const action = this.selectAction(actions, this._rng, tiles)
+      this._pendingAction = {
+        action,
+        executeAt: this._tickCounter + this.REACTION_DELAY
+      }
+      this._decisionTick = this._tickCounter + this.DECISION_CD
+    }
+    this._tickCounter++
+  },
+
+  enumerateActions(tiles) {
+    const actions = [{ type: 'wait', cost: 0 }]
+    const side = this.SIDE
+    for (const hexId of Object.keys(tiles)) {
+      const tile = tiles[hexId]
+      if (!tile) continue
+      if (tile.state === 'openable' && tile.owner === side) {
+        actions.push({ type: 'open_tile', tile, cost: tile.price })
+      }
+      if (tile.state === 'opened' && tile.owner === side && tile.building
+          && UpgradeSystem.canUpgrade(tile)) {
+        const cost = UpgradeSystem.getCost(tile)
+        if (cost != null) {
+          actions.push({ type: 'upgrade', tile, cost })
+        }
+      }
+    }
+    return actions
+  },
+
+  scoreAction(action, tiles) {
+    if (action.type === 'wait') return 0
+    let score = 0
+    if (action.type === 'open_tile') {
+      const { tile } = action
+      if (tile.icon === 'metal') score += 25
+      else if (tile.icon === 'shield') score += 12
+      else if (tile.icon === '?') {
+        score += (tile.price >= 100 ? 12 : tile.price >= 50 ? 8 : 4)
+      } else if (tile.icon === 'helmet') score += 6
+      const neighbors = HexGrid.getNeighbors(tile.q, tile.r)
+      let enemyAdj = 0
+      for (const n of neighbors) {
+        const nt = tiles[`${n.q},${n.r}`]
+        if (nt && nt.owner === 'player') enemyAdj++
+      }
+      if (tile.icon === 'shield') score += enemyAdj * 3
+      score += enemyAdj * 1.5
+      if (ResourceSystem.gold[this.SIDE] >= action.cost) score += 5
+    } else if (action.type === 'upgrade') {
+      const { tile } = action
+      if (tile.building.type === 'gold_mine') {
+        const income = UpgradeSystem.getIncome(tile)
+        const nextIncome = income * 1.5
+        const gainPer6s = (nextIncome - income)
+        const ticksToPayback = action.cost / (gainPer6s / 60)
+        score = 40 - Math.min(20, ticksToPayback / 12)
+      } else if (tile.building.type === 'archer_tower') {
+        const neighbors = HexGrid.getNeighbors(tile.q, tile.r)
+        let enemyAdj = 0
+        for (const n of neighbors) {
+          const nt = tiles[`${n.q},${n.r}`]
+          if (nt && nt.owner === 'player') enemyAdj++
+        }
+        if (this._difficulty === 'hard') {
+          score = 15 + enemyAdj * 5
+        } else {
+          score = 8 + enemyAdj * 2
+        }
+      }
+    }
+    if (this._difficulty === 'normal' && this._rng) {
+      score += (this._rng.nextFloat() - 0.5) * 10
+    }
+    return score
+  },
+
+  selectAction(actions, rng, tiles) {
+    if (!actions || actions.length === 0) return { type: 'wait', cost: 0 }
+    const affordAny = actions.some(a =>
+      a.type === 'wait' || ResourceSystem.gold[this.SIDE] >= a.cost)
+    if (!affordAny) return { type: 'wait', cost: 0 }
+    const affordable = actions.filter(a =>
+      a.type === 'wait' || ResourceSystem.gold[this.SIDE] >= a.cost)
+    const scored = affordable.map(a => ({ action: a, score: this.scoreAction(a, tiles) }))
+    scored.sort((x, y) => y.score - x.score)
+    if (this._difficulty === 'hard') {
+      return scored[0].action
+    }
+    const k = Math.min(3, scored.length)
+    const topK = scored.slice(0, k)
+    const pick = topK[Math.floor(rng.nextFloat() * k)]
+    return pick.action
+  },
+
+  executeAction(action, tiles, rng) {
+    if (!action) return
+    if (action.type === 'wait') return
+    if (action.type === 'open_tile') {
+      const { tile } = action
+      if (!tile || tile.state !== 'openable' || tile.owner !== this.SIDE) return
+      if (!ResourceSystem.trySpend(this.SIDE, tile.price)) return
+      const result = TileSystem.open(
+        { icon: tile.icon, price: tile.price }, rng)
+      tile.state = 'opened'
+      delete tile.icon
+      delete tile.price
+      this._applyOpenResult(tile, result)
+      TileSystem.activateOpenableTiles(tiles, rng)
+    } else if (action.type === 'upgrade') {
+      UpgradeSystem.upgrade(action.tile, this.SIDE)
+    }
+  },
+
+  _applyOpenResult(tile, result) {
+    if (result.type === 'empty') {
+      tile.building = null
+    } else if (result.type === 'barracks') {
+      const spec = BuildingTypes.getSpec('barracks')
+      tile.building = { type: 'barracks', tier: result.tier, hp: spec.hp, maxHp: spec.hp }
+      BarracksSystem.registerBarracks(`${tile.q},${tile.r}`)
+    } else if (result.type === 'unit_card') {
+      const spec = BuildingTypes.getSpec('barracks')
+      tile.building = { type: 'barracks', tier: result.tier, card: true,
+        hp: spec.hp, maxHp: spec.hp }
+      BarracksSystem.registerBarracks(`${tile.q},${tile.r}`)
+    } else if (result.type === 'archer_tower') {
+      const spec = BuildingTypes.getSpec('archer_tower', result.priceTier)
+      tile.building = { type: 'archer_tower', priceTier: result.priceTier,
+        hp: spec.hp, maxHp: spec.hp, atk: spec.atk, range: spec.range,
+        attackCd: 0 }
+    } else if (result.type === 'gold_mine') {
+      const spec = BuildingTypes.getSpec('gold_mine')
+      tile.building = { type: 'gold_mine', hp: spec.hp, maxHp: spec.hp, level: 0 }
+    }
+  }
+}
+
+// ============================================================
 // v2 GameState（格子状态机 + 开局布局 + 经济系统 + 兵营吐兵）
 // ============================================================
 const PLAYER_HQ = { q: 4, r: 11, owner: 'player' }
@@ -1319,6 +1507,7 @@ function initGameState() {
   RuinSystem.init()
   CombatSystem.init()
   VictorySystem.init()
+  AIBehavior.init()
 
   for (const hexId of Object.keys(tiles)) {
     const tile = tiles[hexId]
@@ -1730,12 +1919,26 @@ const gameLoop = createGameLoop(() => {
     BarracksSystem.tick(gameState.tiles, SeededRNG)
     MoveUnits.tick(BarracksSystem.units, gameState.tiles)
     CombatSystem.tick(BarracksSystem.units, gameState.tiles)
+    AIBehavior.tick(gameState.tiles, SeededRNG)
   }
   render()
 })
 
 render()
-gameLoop.start()
+
+function startGameWithDifficulty(mode) {
+  AIBehavior.setDifficulty(mode)
+  document.getElementById('difficulty-label').textContent =
+    mode === 'hard' ? '难度: 困难' : '难度: 普通'
+  const overlay = document.getElementById('difficulty-overlay')
+  if (overlay) overlay.style.display = 'none'
+  gameLoop.start()
+}
+
+const btnNormal = document.getElementById('btn-normal')
+const btnHard = document.getElementById('btn-hard')
+if (btnNormal) btnNormal.addEventListener('click', () => startGameWithDifficulty('normal'))
+if (btnHard) btnHard.addEventListener('click', () => startGameWithDifficulty('hard'))
 
 // ============================================================
 // Embedded assertions: HexGrid (v2 — 9×12 + 湖水)
@@ -3352,6 +3555,217 @@ gameLoop.start()
   console.assert(VictorySystem.wave === null, 'reset clears wave')
 
   console.log('[test] VictorySystem tests passed')
+})()
+
+// ============================================================
+// Embedded assertions: AIBehavior（评分-选择算法 + 两档难度）
+// ============================================================
+;(function testAIBehavior() {
+  function freshTiles() {
+    const tiles = {}
+    for (let r = 0; r < HexGrid.ROWS; r++) {
+      for (let q = 0; q < HexGrid.COLS; q++) {
+        tiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+      }
+    }
+    return tiles
+  }
+
+  // T1: enumerateActions 无可开/可升时只剩 Wait
+  AIBehavior.init()
+  AIBehavior.setDifficulty('hard')
+  const t1 = freshTiles()
+  const a1 = AIBehavior.enumerateActions(t1)
+  console.assert(a1.length === 1, `应只返回 Wait，实际长度 ${a1.length}`)
+  console.assert(a1[0].type === 'wait', `唯一动作应为 wait，实际 ${a1[0].type}`)
+  console.assert(a1[0].cost === 0, `Wait 代价应为 0，实际 ${a1[0].cost}`)
+
+  // T2: enumerateActions 列出所有己方可开 + 可升级
+  AIBehavior.init()
+  const t2 = freshTiles()
+  t2['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened',
+    building: { type: 'gold_mine', hp: 150, maxHp: 150, level: 0 } }
+  t2['3,1'] = { q: 3, r: 1, owner: 'ai', state: 'openable', icon: 'metal', price: 25 }
+  t2['5,1'] = { q: 5, r: 1, owner: 'ai', state: 'openable', icon: '?', price: 50 }
+  t2['4,2'] = { q: 4, r: 2, owner: 'player', state: 'openable', icon: 'metal', price: 25 }
+  const a2 = AIBehavior.enumerateActions(t2)
+  const wait2 = a2.filter(a => a.type === 'wait')
+  const open2 = a2.filter(a => a.type === 'open_tile')
+  const upgrade2 = a2.filter(a => a.type === 'upgrade')
+  console.assert(wait2.length === 1, `应有 1 个 Wait，实际 ${wait2.length}`)
+  console.assert(open2.length === 2, `应有 2 个 OpenTile（仅 AI），实际 ${open2.length}`)
+  console.assert(upgrade2.length === 1, `应有 1 个 Upgrade，实际 ${upgrade2.length}`)
+  console.assert(open2.every(a => a.tile.owner === 'ai'), 'OpenTile 必须都是 AI 格子')
+  console.assert(upgrade2[0].cost === 40, `金矿升级成本应为 40，实际 ${upgrade2[0].cost}`)
+
+  // T3: scoreAction 金矿动作分数高于兵营（同价）
+  AIBehavior.init()
+  AIBehavior.setDifficulty('hard')
+  const t3 = freshTiles()
+  t3['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'openable', icon: 'metal', price: 25 }
+  t3['3,1'] = { q: 3, r: 1, owner: 'ai', state: 'openable', icon: '?', price: 25 }
+  t3['5,1'] = { q: 5, r: 1, owner: 'ai', state: 'openable', icon: 'shield', price: 25 }
+  ResourceSystem.init()
+  ResourceSystem.gold.ai = 100
+  const mineA = { type: 'open_tile', tile: t3['4,1'], cost: 25 }
+  const barrA = { type: 'open_tile', tile: t3['3,1'], cost: 25 }
+  const towA = { type: 'open_tile', tile: t3['5,1'], cost: 25 }
+  const sMine = AIBehavior.scoreAction(mineA, t3)
+  const sBarr = AIBehavior.scoreAction(barrA, t3)
+  const sTow = AIBehavior.scoreAction(towA, t3)
+  console.assert(sMine > sBarr,
+    `金矿(${sMine}) 应高于兵营(${sBarr})`)
+  console.assert(sMine > sTow,
+    `金矿(${sMine}) 应高于箭塔(${sTow})`)
+  console.assert(sTow > sBarr,
+    `箭塔(${sTow}) 应高于兵营(${sBarr})`)
+
+  // T4: 金币不足时 selectAction 强制 Wait
+  AIBehavior.init()
+  AIBehavior.setDifficulty('hard')
+  ResourceSystem.init()
+  ResourceSystem.gold.ai = 0
+  const t4 = freshTiles()
+  t4['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'openable', icon: 'metal', price: 25 }
+  t4['3,1'] = { q: 3, r: 1, owner: 'ai', state: 'openable', icon: '?', price: 50 }
+  const a4 = AIBehavior.enumerateActions(t4)
+  const rng4 = SeededRNG.init(7)
+  const pick4 = AIBehavior.selectAction(a4, rng4, t4)
+  console.assert(pick4.type === 'wait',
+    `金币不足时应选 Wait，实际 ${pick4.type}`)
+
+  // T5: hard 档 + 同 seed 决策 100% 一致（argmax）
+  AIBehavior.init()
+  AIBehavior.setDifficulty('hard')
+  ResourceSystem.init()
+  ResourceSystem.gold.ai = 200
+  const t5 = freshTiles()
+  t5['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened',
+    building: { type: 'gold_mine', hp: 150, maxHp: 150, level: 0 } }
+  t5['3,1'] = { q: 3, r: 1, owner: 'ai', state: 'openable', icon: '?', price: 50 }
+  t5['5,1'] = { q: 5, r: 1, owner: 'ai', state: 'openable', icon: 'shield', price: 50 }
+  const picks5 = []
+  for (let i = 0; i < 20; i++) {
+    AIBehavior._rng = SeededRNG.init(123)
+    const a5 = AIBehavior.enumerateActions(t5)
+    picks5.push(AIBehavior.selectAction(a5, AIBehavior._rng, t5).type)
+  }
+  const first5 = picks5[0]
+  console.assert(picks5.every(p => p === first5),
+    `hard 档同 seed 应 100% 一致，实际 ${JSON.stringify(picks5)}`)
+
+  // T6: normal 档 + 不同 seed 应出现 ≥ 2 种动作（top-k 随机性）
+  AIBehavior.init()
+  AIBehavior.setDifficulty('normal')
+  ResourceSystem.init()
+  ResourceSystem.gold.ai = 200
+  const picks6 = []
+  for (let i = 0; i < 30; i++) {
+    const t6 = freshTiles()
+    t6['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened',
+      building: { type: 'gold_mine', hp: 150, maxHp: 150, level: 0 } }
+    t6['3,1'] = { q: 3, r: 1, owner: 'ai', state: 'openable', icon: '?', price: 50 }
+    AIBehavior._rng = SeededRNG.init(456 + i * 7919)
+    const a6 = AIBehavior.enumerateActions(t6)
+    picks6.push(AIBehavior.selectAction(a6, AIBehavior._rng, t6).type)
+  }
+  const distinct6 = new Set(picks6)
+  console.assert(distinct6.size >= 2,
+    `normal 档应出现 ≥2 种动作，实际 ${JSON.stringify(picks6)}`)
+
+  // T7: tick 决策间延迟 = DECISION_CD（15 ticks）
+  AIBehavior.init()
+  AIBehavior.setDifficulty('hard')
+  ResourceSystem.init()
+  ResourceSystem.gold.ai = 200
+  BarracksSystem.init()
+  const t7 = freshTiles()
+  t7['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened',
+    building: { type: 'gold_mine', hp: 150, maxHp: 150, level: 0 } }
+  t7['3,1'] = { q: 3, r: 1, owner: 'ai', state: 'openable', icon: 'metal', price: 25 }
+  const rng7 = SeededRNG.init(77)
+  AIBehavior.tick(t7, rng7)
+  console.assert(AIBehavior._pendingAction !== null, 'tick 0 应产生 pending')
+  console.assert(AIBehavior._decisionTick === 15,
+    `下一次决策应在 tick 15，实际 ${AIBehavior._decisionTick}`)
+  for (let i = 1; i < 15; i++) {
+    AIBehavior.tick(t7, rng7)
+  }
+  console.assert(AIBehavior._pendingAction === null,
+    '15 ticks 后应已执行并清空 pending')
+  console.assert(t7['3,1'].state === 'opened', 'AI 应已开启格子')
+  console.assert(ResourceSystem.gold.ai === 175,
+    `扣费后应为 175，实际 ${ResourceSystem.gold.ai}`)
+
+  // T8: tick 反应延迟 4 ticks（tick 3 未执行，tick 4 执行）
+  AIBehavior.init()
+  AIBehavior.setDifficulty('hard')
+  ResourceSystem.init()
+  ResourceSystem.gold.ai = 200
+  BarracksSystem.init()
+  const t8 = freshTiles()
+  t8['3,1'] = { q: 3, r: 1, owner: 'ai', state: 'openable', icon: 'metal', price: 25 }
+  const rng8 = SeededRNG.init(88)
+  AIBehavior.tick(t8, rng8)
+  console.assert(AIBehavior._pendingAction !== null, 'tick 0 应产生 pending')
+  for (let i = 1; i <= 3; i++) AIBehavior.tick(t8, rng8)
+  console.assert(t8['3,1'].state === 'openable',
+    `tick 3 应仍未执行，实际 ${t8['3,1'].state}`)
+  console.assert(ResourceSystem.gold.ai === 200,
+    `tick 3 金币应仍为 200，实际 ${ResourceSystem.gold.ai}`)
+  AIBehavior.tick(t8, rng8)
+  console.assert(t8['3,1'].state === 'opened', 'tick 4 应已执行')
+  console.assert(ResourceSystem.gold.ai === 175,
+    `tick 4 扣费后应为 175，实际 ${ResourceSystem.gold.ai}`)
+
+  // T9: 普通档只升金矿；困难档在前线压力大时升箭塔
+  AIBehavior.init()
+  AIBehavior.setDifficulty('normal')
+  ResourceSystem.init()
+  ResourceSystem.gold.ai = 200
+  const t9 = freshTiles()
+  t9['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened',
+    building: { type: 'gold_mine', hp: 150, maxHp: 150, level: 0 } }
+  t9['5,1'] = { q: 5, r: 1, owner: 'ai', state: 'opened',
+    building: { type: 'archer_tower', priceTier: 50, hp: 250, maxHp: 250,
+      atk: 35, range: 3.5, level: 0 } }
+  t9['5,2'] = { q: 5, r: 2, owner: 'player', state: 'opened' }
+  t9['4,2'] = { q: 4, r: 2, owner: 'player', state: 'opened' }
+  t9['6,2'] = { q: 6, r: 2, owner: 'player', state: 'opened' }
+  const mineAct = { type: 'upgrade', tile: t9['4,1'], cost: 40 }
+  const towerAct = { type: 'upgrade', tile: t9['5,1'], cost: 30 }
+  AIBehavior._rng = null
+  const normalMine = AIBehavior.scoreAction(mineAct, t9)
+  const normalTower = AIBehavior.scoreAction(towerAct, t9)
+  console.assert(normalMine > normalTower,
+    `普通档金矿(${normalMine.toFixed(1)}) 应高于箭塔(${normalTower.toFixed(1)})`)
+  AIBehavior.setDifficulty('hard')
+  AIBehavior._rng = null
+  const hardMine = AIBehavior.scoreAction(mineAct, t9)
+  const hardTower = AIBehavior.scoreAction(towerAct, t9)
+  console.assert(hardTower > hardMine,
+    `困难档前线压力下箭塔(${hardTower.toFixed(1)}) 应高于金矿(${hardMine.toFixed(1)})`)
+
+  // T10: executeAction 开地块走 TileSystem.open（同概率表）
+  AIBehavior.init()
+  AIBehavior.setDifficulty('hard')
+  ResourceSystem.init()
+  ResourceSystem.gold.ai = 200
+  BarracksSystem.init()
+  const t10 = freshTiles()
+  t10['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'openable', icon: 'metal', price: 25 }
+  const rng10 = SeededRNG.init(99)
+  AIBehavior.executeAction({ type: 'open_tile', tile: t10['4,1'], cost: 25 }, t10, rng10)
+  console.assert(t10['4,1'].state === 'opened', '格子应变 opened')
+  console.assert(t10['4,1'].building && t10['4,1'].building.type === 'gold_mine',
+    `metal 应出 gold_mine，实际 ${JSON.stringify(t10['4,1'].building)}`)
+  console.assert(ResourceSystem.gold.ai === 175,
+    `扣费后应为 175，实际 ${ResourceSystem.gold.ai}`)
+  const beforeGold = ResourceSystem.gold.ai
+  AIBehavior.executeAction({ type: 'wait' }, t10, rng10)
+  console.assert(ResourceSystem.gold.ai === beforeGold, 'Wait 不应扣费')
+
+  console.log('[test] AIBehavior tests passed (10 cases)')
 })()
 
 // 测试会重置全局系统，重新初始化游戏状态
