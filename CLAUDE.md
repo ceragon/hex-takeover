@@ -49,7 +49,7 @@ Card collection/upgrades, multi-faction, unit merge/star, real-time PvP, audio/B
 ## Known Pitfalls
 
 <!-- 由 /work-issues command 自动维护，最多 8 条 -->
-- **favicon.ico 404:** 浏览器自动请求 `/favicon.ico` 导致控制台 404。修复：`<link rel="icon" href="data:,">` 内联空图标
+- **Playwright browser_click 参数错误死循环:** `browser_click` 需要 `element`（描述）和 `target`（快照引用），传错参数名（如 `ref`）会报错 `expected string, received undefined`，在 auto mode 下容易陷入"重试→报错→再重试"循环。修复：首次报错后立即检查参数名，查看 Playwright 工具 schema 确认正确参数。
 - **GameLoop 断言时机:** `console.assert(tickCount > 0)` 在 loop 启动前同步执行，tickCount 尚未更新。修复：用 `setTimeout(..., 200)` 延迟验证
 - **Playwright file:// 拦截:** Playwright MCP 阻止 `file://` 协议访问。修复：用 `python3 -m http.server` 提供 HTTP 服务
 - **初始化顺序冲突:** `initGameState()` 在 `TileReveal` 定义之前调用，导致 `Cannot access before initialization`。修复：将依赖模块（HexGrid、TileReveal）放在 GameState 初始化之前
