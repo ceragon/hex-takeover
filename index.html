@@ -338,6 +338,11 @@ const OpeningLayout = {
         const priceTier = rng.weightedPick([50, 100], [50, 50])
         building = { type: 'archer_tower', priceTier }
       }
+      const spec = BuildingTypes.getSpec(building.type, building.priceTier)
+      if (spec) {
+        building.hp = spec.hp
+        building.maxHp = spec.hp
+      }
       tiles[hexId] = {
         q, r,
         owner: hq.owner,
@@ -437,6 +442,28 @@ const UnitTypes = {
 }
 
 // ============================================================
+// BuildingTypes: 建筑纯数据表（HP / ATK / 射程）
+// HP: HQ 1000 / 50 金箭塔 250 / 100 金箭塔 350 / 金矿 150 / 兵营 200
+// 升级系统（slice 7）会扩展此表
+// ============================================================
+const BuildingTypes = {
+  definitions: {
+    hq:              { hp: 1000, atk: 50, range: 6.5 },
+    archer_tower_50: { hp: 250,  atk: 35, range: 3.5 },
+    archer_tower_100:{ hp: 350,  atk: 50, range: 5.0 },
+    gold_mine:       { hp: 150,  atk: 0,  range: 0   },
+    barracks:        { hp: 200,  atk: 0,  range: 0   }
+  },
+
+  getSpec(type, priceTier) {
+    if (type === 'archer_tower') {
+      return this.definitions[`archer_tower_${priceTier}`] || this.definitions.archer_tower_50
+    }
+    return this.definitions[type] || null
+  }
+}
+
+// ============================================================
 // BarracksSystem: 已开兵营/头盔格子按 CD 吐出单位
 // ============================================================
 const BarracksSystem = {
@@ -456,12 +483,17 @@ const BarracksSystem = {
     delete this.timers[hexId]
   },
 
+  destroyBarracks(hexId) {
+    delete this.timers[hexId]
+  },
+
   tick(tiles, rng) {
     const spawned = []
     for (const hexId of Object.keys(this.timers)) {
       const tile = tiles[hexId]
       if (!tile || !tile.building) continue
       if (tile.building.type !== 'barracks') continue
+      if (tile.ruin) { this.destroyBarracks(hexId); continue }
 
       const tier = tile.building.tier
       const cdTicks = UnitTypes.tierToCd[tier] * 10
@@ -481,7 +513,8 @@ const BarracksSystem = {
           speed: unitDef.speed,
           range: unitDef.range,
           trait: unitDef.trait,
-          moveProgress: 0
+          moveProgress: 0,
+          attackCd: 0
         }
         this.units.push(unit)
         spawned.push(unit)
@@ -515,6 +548,276 @@ const TerritorySystem = {
       if (this.owners[h] === owner) c++
     }
     return c
+  }
+}
+
+// ============================================================
+// RuinSystem: 废墟生命周期（建筑摧毁 → 废墟格，不可重建、不可通行）
+// ============================================================
+const RuinSystem = {
+  ruins: {},
+
+  init() {
+    this.ruins = {}
+  },
+
+  createRuin(hexId, tiles) {
+    this.ruins[hexId] = true
+    const tile = tiles[hexId]
+    if (tile) {
+      tile.ruin = true
+      if (tile.building && tile.building.type === 'barracks') {
+        BarracksSystem.destroyBarracks(hexId)
+      }
+      tile.building = null
+    }
+  },
+
+  isRuin(hexId) {
+    return this.ruins[hexId] === true
+  },
+
+  clear(hexId) {
+    delete this.ruins[hexId]
+  }
+}
+
+// ============================================================
+// CombatSystem: 单位交战 + 建筑受击 + 品阶压制 + 远近切换 + AOE + 箭塔/HQ 自动攻击
+// 攻击频率 1 次/秒（每 10 个 tick 触发一次攻击判定）
+// 品阶压制：damage = atk * 1.5^(attackerTierRank - defenderTierRank)
+// ============================================================
+const CombatSystem = {
+  ATTACK_CD: 10,
+  MELEE_RANGE: 1.2,
+  SPLASH_RANGE: 1.5,
+  AOE_MULT: 0.5,
+  TIER_RANK: { green: 1, blue: 2, purple: 3, gold: 4 },
+
+  init() {},
+
+  tierRank(tier) {
+    return this.TIER_RANK[tier] || 1
+  },
+
+  calcDamage(atkStat, attackerTier, defenderTier) {
+    const diff = this.tierRank(attackerTier) - this.tierRank(defenderTier)
+    return Math.round(atkStat * Math.pow(1.5, diff))
+  },
+
+  _hexDist(aHexId, bHexId) {
+    const [sq, sr] = aHexId.split(',').map(Number)
+    const [tq, tr] = bHexId.split(',').map(Number)
+    const ax1 = sq - Math.floor(sr / 2), az1 = sr, ay1 = -ax1 - az1
+    const ax2 = tq - Math.floor(tr / 2), az2 = tr, ay2 = -ax2 - az2
+    return Math.max(Math.abs(ax1 - ax2), Math.abs(ay1 - ay2), Math.abs(az1 - az2))
+  },
+
+  _maxRange(range) {
+    return Array.isArray(range) ? range[1] : range
+  },
+
+  // 单位从当前位置能否攻击到目标（考虑近战/远程双范围）
+  canAttack(unit, targetHexId) {
+    const d = this._hexDist(unit.hexId, targetHexId)
+    const melee = this.MELEE_RANGE
+    if (Array.isArray(unit.range)) {
+      return d <= unit.range[1] + 0.01
+    }
+    return d <= unit.range + 0.01
+  },
+
+  // 单位选择具体攻击目标（单位 vs 建筑），考虑射程
+  findAttackTarget(unit, allUnits, tiles) {
+    const enemy = unit.owner === 'player' ? 'ai' : 'player'
+    const melee = this.MELEE_RANGE
+    const maxR = this._maxRange(unit.range)
+
+    let bestUnit = null
+    let bestUnitDist = Infinity
+    let bestBuilding = null
+    let bestBuildingDist = Infinity
+
+    for (const u of allUnits) {
+      if (u === unit || u.owner === unit.owner) continue
+      if (u.hp <= 0) continue
+      const d = this._hexDist(unit.hexId, u.hexId)
+      if (d <= maxR + 0.01 && d < bestUnitDist) {
+        bestUnitDist = d
+        bestUnit = u
+      }
+    }
+
+    for (const hexId of Object.keys(tiles)) {
+      const tile = tiles[hexId]
+      if (!tile || tile.owner !== enemy || !tile.building) continue
+      if (tile.ruin) continue
+      const d = this._hexDist(unit.hexId, hexId)
+      if (d <= maxR + 0.01 && d < bestBuildingDist) {
+        bestBuildingDist = d
+        bestBuilding = hexId
+      }
+    }
+
+    // 金阶：远程模式优先单位，近战模式打最近
+    if (unit.tier === 'gold' && unit.mode !== 'melee' && bestUnit) {
+      return { kind: 'unit', target: bestUnit, hexId: bestUnit.hexId, dist: bestUnitDist }
+    }
+
+    if (bestUnitDist <= bestBuildingDist) {
+      if (bestUnit) return { kind: 'unit', target: bestUnit, hexId: bestUnit.hexId, dist: bestUnitDist }
+    }
+    if (bestBuilding) return { kind: 'building', hexId: bestBuilding, dist: bestBuildingDist }
+    if (bestUnit) return { kind: 'unit', target: bestUnit, hexId: bestUnit.hexId, dist: bestUnitDist }
+    return null
+  },
+
+  // 单位攻击：近战/远程/AOE + 品阶压制
+  resolveUnitAttack(unit, target, tiles, allUnits) {
+    const melee = this.MELEE_RANGE
+    let mode
+    if (unit.tier === 'gold') {
+      mode = unit.mode === 'melee' ? 'melee' : 'ranged'
+    } else {
+      const isRanged = unit.trait === 'range_swap' || unit.tier === 'purple'
+      mode = (isRanged && target.dist > melee + 0.01) ? 'ranged' : 'melee'
+    }
+
+    if (target.kind === 'unit') {
+      const dmg = this.calcDamage(unit.atk, unit.tier, target.target.tier)
+      target.target.hp -= dmg
+      if (unit.tier === 'gold' && mode === 'ranged' && allUnits) {
+        this._applySplash(unit, target.target, allUnits, tiles)
+      }
+    } else {
+      const tile = tiles[target.hexId]
+      if (!tile || !tile.building) return
+      const dmg = this.calcDamage(unit.atk, unit.tier, 'green')
+      tile.building.hp -= dmg
+      tile.lastAttacker = unit.owner
+    }
+
+    unit.attackCd = this.ATTACK_CD
+    if (unit.tier === 'gold') {
+      if (mode === 'ranged') unit.mode = 'melee'
+    }
+  },
+
+  // 实际执行单位攻击（含 AOE 溅射）
+  attackUnit(unit, targetHexId, allUnits, tiles) {
+    const target = this.findAttackTarget(unit, allUnits, tiles)
+    if (!target) return
+    this.resolveUnitAttack(unit, target, tiles, allUnits)
+  },
+
+  _applySplash(attacker, primaryTarget, allUnits, tiles) {
+    const splashDist = this.SPLASH_RANGE
+    const enemies = (allUnits || []).filter(u =>
+      u !== primaryTarget && u !== attacker && u.owner !== attacker.owner && u.hp > 0
+    )
+    for (const e of enemies) {
+      const d = this._hexDist(primaryTarget.hexId, e.hexId)
+      if (d <= splashDist + 0.01) {
+        const dmg = Math.round(this.calcDamage(attacker.atk, attacker.tier, e.tier) * this.AOE_MULT)
+        e.hp -= dmg
+      }
+    }
+  },
+
+  // 箭塔 / HQ 自动攻击射程内最近的敌方单位
+  attackBuilding(hexId, tile, allUnits, tiles) {
+    if (!tile || !tile.building) return
+    if (tile.building.type !== 'archer_tower' && tile.building.type !== 'hq') return
+    const spec = BuildingTypes.getSpec(tile.building.type, tile.building.priceTier)
+    if (!spec || spec.atk <= 0) return
+    if ((tile.building.attackCd || 0) > 0) return
+
+    let best = null
+    let bestDist = Infinity
+    for (const u of allUnits) {
+      if (u.owner === tile.owner) continue
+      if (u.hp <= 0) continue
+      const d = this._hexDist(hexId, u.hexId)
+      if (d <= spec.range + 0.01 && d < bestDist) {
+        bestDist = d
+        best = u
+      }
+    }
+    if (best) {
+      best.hp -= spec.atk
+      tile.building.attackCd = this.ATTACK_CD
+      tile.lastAttacker = tile.owner
+    }
+  },
+
+  // 清理死亡单位（触发 DeathEffect 留给 slice 9）+ 建筑 HP 归零变废墟
+  _cleanup(units, tiles) {
+    for (let i = units.length - 1; i >= 0; i--) {
+      if (units[i].hp <= 0) {
+        units.splice(i, 1)
+      }
+    }
+    for (const hexId of Object.keys(tiles)) {
+      const tile = tiles[hexId]
+      if (!tile || !tile.building) continue
+      if (tile.building.hp === undefined) continue
+      if (tile.building.hp > 0) continue
+      const attacker = tile.lastAttacker
+      const prevOwner = tile.owner
+      this._destroyBuilding(hexId, tile, tiles)
+      if (attacker && attacker !== prevOwner) {
+        TerritorySystem.claim(hexId, attacker, tiles, SeededRNG)
+      }
+    }
+  },
+
+  _destroyBuilding(hexId, tile, tiles) {
+    if (tile.building && tile.building.type === 'barracks') {
+      BarracksSystem.destroyBarracks(hexId)
+    }
+    RuinSystem.createRuin(hexId, tiles)
+  },
+
+  // 主 tick：递减 CD → 收集攻击（同步）→ 应用伤害 → 建筑攻击 → 清理
+  tick(units, tiles) {
+    for (const u of units) {
+      if (u.hp > 0) u.attackCd = Math.max(0, (u.attackCd || 0) - 1)
+      if (u.tier === 'gold' && u.attackCd === 0 && u.mode === 'melee') {
+        u.mode = 'ranged'
+      }
+    }
+    for (const hexId of Object.keys(tiles)) {
+      const tile = tiles[hexId]
+      if (!tile || !tile.building || tile.ruin) continue
+      if (tile.building.attackCd !== undefined && tile.building.attackCd > 0) {
+        tile.building.attackCd = Math.max(0, tile.building.attackCd - 1)
+      }
+    }
+
+    // 单位攻击：先收集所有攻击事件，再统一应用（同步战斗）
+    const aliveUnits = units.filter(u => u.hp > 0)
+    const pendingHits = []
+    for (const u of aliveUnits) {
+      if (u.attackCd > 0) continue
+      const target = this.findAttackTarget(u, aliveUnits, tiles)
+      if (!target) continue
+      pendingHits.push({ attacker: u, target })
+    }
+    for (const hit of pendingHits) {
+      this.resolveUnitAttack(hit.attacker, hit.target, tiles, aliveUnits)
+    }
+
+    // 建筑攻击（箭塔 / HQ）
+    for (const hexId of Object.keys(tiles)) {
+      const tile = tiles[hexId]
+      if (!tile || !tile.building || tile.ruin) continue
+      if (tile.building.type === 'archer_tower' || tile.building.type === 'hq') {
+        this.attackBuilding(hexId, tile, aliveUnits, tiles)
+      }
+    }
+
+    // 清理死亡单位 + 建筑 HP 归零变废墟
+    this._cleanup(units, tiles)
   }
 }
 
@@ -657,10 +960,25 @@ const MoveUnits = {
     return null
   },
 
+  canAttackFromHere(unit, target, tiles) {
+    if (typeof CombatSystem === 'undefined') return false
+    const [sq, sr] = unit.hexId.split(',').map(Number)
+    const [tq, tr] = target.hexId.split(',').map(Number)
+    // Even-r offset → cube → distance（轻微高估，CombatSystem 再用 cube 精确判定）
+    const ax1 = sq - Math.floor(sr / 2), az1 = sr, ay1 = -ax1 - az1
+    const ax2 = tq - Math.floor(tr / 2), az2 = tr, ay2 = -ax2 - az2
+    const hexDist = Math.max(Math.abs(ax1 - ax2), Math.abs(ay1 - ay2), Math.abs(az1 - az2))
+    const maxR = CombatSystem._maxRange(unit.range)
+    return hexDist <= maxR + 0.01
+  },
+
   tick(units, tiles) {
     for (const unit of units) {
       const target = this.selectTarget(unit, units, tiles)
       if (!target) continue
+
+      // 已在攻击范围 → 不移动，让 CombatSystem 接管攻击
+      if (this.canAttackFromHere(unit, target, tiles)) continue
 
       const [cq, cr] = unit.hexId.split(',').map(Number)
       const path = this.computeBFS({ q: cq, r: cr }, { q: target.q, r: target.r }, tiles)
@@ -672,8 +990,11 @@ const MoveUnits = {
       if (unit.moveProgress >= 1) {
         unit.moveProgress -= 1
         const next = path[0]
+        const nextId = `${next.q},${next.r}`
+        const nextTile = tiles[nextId]
+        if (nextTile && nextTile.ruin) continue
         unit.prevHexId = unit.hexId
-        unit.hexId = `${next.q},${next.r}`
+        unit.hexId = nextId
 
         const tile = tiles[unit.hexId]
         if (tile && tile.owner && tile.owner !== unit.owner) {
@@ -730,15 +1051,19 @@ const ClickHandler = {
     if (result.type === 'empty') {
       tile.building = null
     } else if (result.type === 'barracks') {
-      tile.building = { type: 'barracks', tier: result.tier }
+      const spec = BuildingTypes.getSpec('barracks')
+      tile.building = { type: 'barracks', tier: result.tier, hp: spec.hp, maxHp: spec.hp }
       BarracksSystem.registerBarracks(`${tile.q},${tile.r}`)
     } else if (result.type === 'unit_card') {
-      tile.building = { type: 'barracks', tier: result.tier, card: true }
+      const spec = BuildingTypes.getSpec('barracks')
+      tile.building = { type: 'barracks', tier: result.tier, card: true, hp: spec.hp, maxHp: spec.hp }
       BarracksSystem.registerBarracks(`${tile.q},${tile.r}`)
     } else if (result.type === 'archer_tower') {
-      tile.building = { type: 'archer_tower', priceTier: result.priceTier }
+      const spec = BuildingTypes.getSpec('archer_tower', result.priceTier)
+      tile.building = { type: 'archer_tower', priceTier: result.priceTier, hp: spec.hp, maxHp: spec.hp }
     } else if (result.type === 'gold_mine') {
-      tile.building = { type: 'gold_mine' }
+      const spec = BuildingTypes.getSpec('gold_mine')
+      tile.building = { type: 'gold_mine', hp: spec.hp, maxHp: spec.hp }
     }
 
     TileSystem.activateOpenableTiles(tiles, SeededRNG)
@@ -765,8 +1090,11 @@ function initGameState() {
 
   const playerHqId = `${PLAYER_HQ.q},${PLAYER_HQ.r}`
   const aiHqId = `${AI_HQ.q},${AI_HQ.r}`
-  tiles[playerHqId] = { q: PLAYER_HQ.q, r: PLAYER_HQ.r, owner: 'player', state: 'opened', building: { type: 'hq' } }
-  tiles[aiHqId] = { q: AI_HQ.q, r: AI_HQ.r, owner: 'ai', state: 'opened', building: { type: 'hq' } }
+  const hqSpec = BuildingTypes.getSpec('hq')
+  tiles[playerHqId] = { q: PLAYER_HQ.q, r: PLAYER_HQ.r, owner: 'player', state: 'opened',
+    building: { type: 'hq', hp: hqSpec.hp, maxHp: hqSpec.hp } }
+  tiles[aiHqId] = { q: AI_HQ.q, r: AI_HQ.r, owner: 'ai', state: 'opened',
+    building: { type: 'hq', hp: hqSpec.hp, maxHp: hqSpec.hp } }
 
   OpeningLayout.generateOpening(PLAYER_HQ, tiles, SeededRNG)
   OpeningLayout.generateOpening(AI_HQ, tiles, SeededRNG)
@@ -774,6 +1102,8 @@ function initGameState() {
   ResourceSystem.init()
   BarracksSystem.init()
   TerritorySystem.init()
+  RuinSystem.init()
+  CombatSystem.init()
 
   for (const hexId of Object.keys(tiles)) {
     const tile = tiles[hexId]
@@ -861,7 +1191,11 @@ function renderGrid() {
       let labelSize = 10
       let subLabel = ''
 
-      if (tile.state === 'opened' && tile.building) {
+      if (tile.ruin) {
+        color = '#3a2a1a'
+        label = '废'
+        labelSize = 10
+      } else if (tile.state === 'opened' && tile.building) {
         if (tile.building.type === 'hq') {
           color = tile.owner === 'player' ? '#2266cc' : '#cc2222'
           label = tile.owner === 'player' ? '己方HQ' : '敌方HQ'
@@ -894,6 +1228,19 @@ function renderGrid() {
       drawHex(cx, cy, size - 1, color)
       if (label) drawHexLabel(cx, cy - (subLabel ? 4 : 0), label, labelSize, '#fff')
       if (subLabel) drawHexLabel(cx, cy + 8, subLabel, 8, '#ffcc44')
+
+      // 建筑 HP 条（废墟不显示）
+      if (tile.building && tile.building.hp !== undefined && tile.building.maxHp) {
+        const hpRatio = Math.max(0, tile.building.hp / tile.building.maxHp)
+        const barW = size * 1.2
+        const barH = 3
+        const bx = cx - barW / 2
+        const by = cy + size * 0.7
+        ctx.fillStyle = '#111'
+        ctx.fillRect(bx, by, barW, barH)
+        ctx.fillStyle = hpRatio > 0.6 ? '#3c6' : (hpRatio > 0.3 ? '#ec3' : '#e44')
+        ctx.fillRect(bx, by, barW * hpRatio, barH)
+      }
     }
   }
 }
@@ -983,6 +1330,7 @@ const gameLoop = createGameLoop(() => {
   ResourceSystem.tick(gameState.tiles)
   BarracksSystem.tick(gameState.tiles, SeededRNG)
   MoveUnits.tick(BarracksSystem.units, gameState.tiles)
+  CombatSystem.tick(BarracksSystem.units, gameState.tiles)
   render()
 })
 
@@ -2065,6 +2413,308 @@ gameLoop.start()
 
   console.log('[test] MoveUnits tests passed')
 })()
+
+// ============================================================
+// testCombatSystem: 品阶压制 + 远近切换 + AOE + 建筑受击 + 废墟
+// ============================================================
+;(function testCombatSystem() {
+  function freshTiles() {
+    const tiles = {}
+    for (let r = 0; r < HexGrid.ROWS; r++) {
+      for (let q = 0; q < HexGrid.COLS; q++) {
+        tiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+      }
+    }
+    return tiles
+  }
+  function resetAll() {
+    BarracksSystem.init()
+    BarracksSystem.units = []
+    RuinSystem.init()
+    TerritorySystem.init()
+    CombatSystem.init()
+  }
+
+  // === 1. BuildingTypes spec 查询 ===
+  console.assert(BuildingTypes.getSpec('hq').hp === 1000, 'HQ hp=1000')
+  console.assert(BuildingTypes.getSpec('hq').atk === 50, 'HQ atk=50')
+  console.assert(BuildingTypes.getSpec('hq').range === 6.5, 'HQ range=6.5')
+  console.assert(BuildingTypes.getSpec('archer_tower', 50).hp === 250, 'tower 50 hp=250')
+  console.assert(BuildingTypes.getSpec('archer_tower', 50).range === 3.5, 'tower 50 range=3.5')
+  console.assert(BuildingTypes.getSpec('archer_tower', 100).hp === 350, 'tower 100 hp=350')
+  console.assert(BuildingTypes.getSpec('archer_tower', 100).range === 5.0, 'tower 100 range=5.0')
+  console.assert(BuildingTypes.getSpec('gold_mine').hp === 150, 'gold_mine hp=150')
+  console.assert(BuildingTypes.getSpec('barracks').hp === 200, 'barracks hp=200')
+
+  // === 2. 品阶压制伤害公式：damage = atk * 1.5^(rankDiff) ===
+  console.assert(CombatSystem.calcDamage(100, 'green', 'green') === 100, 'green vs green = 100')
+  console.assert(CombatSystem.calcDamage(100, 'blue', 'green') === 150, 'blue vs green = 150')
+  console.assert(CombatSystem.calcDamage(100, 'green', 'blue') === 67, 'green vs blue = 67')
+  console.assert(CombatSystem.calcDamage(100, 'purple', 'green') === 225, 'purple vs green = 225')
+  console.assert(CombatSystem.calcDamage(100, 'gold', 'green') === 338, 'gold vs green = 338')
+  console.assert(CombatSystem.calcDamage(100, 'green', 'gold') === 30, 'green vs gold = 30')
+
+  // === 3. 近战单位射程 1.2：相邻能攻击，隔一格不行 ===
+  const t3 = freshTiles(); resetAll()
+  t3['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened' }
+  t3['4,4'] = { q: 4, r: 4, owner: 'ai', state: 'opened' }
+  t3['3,3'] = { q: 3, r: 3, owner: 'ai', state: 'opened' }
+  const u3 = [
+    { key: 'skeleton', tier: 'green', owner: 'player', hexId: '4,5', hp: 120, atk: 15, speed: 0.4, range: 1.2, trait: 'melee_tanky', moveProgress: 0, attackCd: 0 },
+    { key: 'wolf', tier: 'green', owner: 'ai', hexId: '4,4', hp: 80, atk: 25, speed: 0.8, range: 1.2, trait: 'melee_fast', moveProgress: 0, attackCd: 10 },
+    { key: 'wolf', tier: 'green', owner: 'ai', hexId: '3,3', hp: 80, atk: 25, speed: 0.8, range: 1.2, trait: 'melee_fast', moveProgress: 0, attackCd: 10 }
+  ]
+  console.assert(CombatSystem.canAttack(u3[0], '4,4') === true, 'melee can attack adjacent')
+  console.assert(CombatSystem.canAttack(u3[0], '3,3') === false, 'melee cannot attack 2-hex away')
+  CombatSystem.tick(u3, t3)
+  console.assert(u3[1].hp === 80 - 15, `green vs green melee should deal 15, got hp=${u3[1].hp}`)
+  console.assert(u3[0].attackCd === 10, 'attack CD should be 10 after attacking')
+
+  // === 4. 远程单位（紫阶骑兵）射程 4.0，2 格外能攻击 ===
+  const t4 = freshTiles(); resetAll()
+  t4['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened' }
+  t4['4,3'] = { q: 4, r: 3, owner: 'ai', state: 'opened' }
+  const u4 = [
+    { key: 'cavalry', tier: 'purple', owner: 'player', hexId: '4,5', hp: 200, atk: 40, speed: 1.0, range: 4.0, trait: 'fly_building', moveProgress: 0, attackCd: 0 },
+    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,3', hp: 120, atk: 15, speed: 0.4, range: 0, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
+  ]
+  console.assert(CombatSystem.canAttack(u4[0], '4,3') === true, 'ranged purple can attack 2 hexes away')
+  CombatSystem.tick(u4, t4)
+  const dmg4 = CombatSystem.calcDamage(40, 'purple', 'green')
+  console.assert(u4[1].hp === 120 - dmg4,
+    `purple vs green = ${dmg4}, hp should be ${120 - dmg4}, got ${u4[1].hp}`)
+
+  // === 5. 蓝阶 range_swap：射程外优先远程，近战范围切近战 ===
+  const t5a = freshTiles(); resetAll()
+  t5a['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened' }
+  t5a['4,3'] = { q: 4, r: 3, owner: 'ai', state: 'opened' }
+  const u5a = [
+    { key: 'archer', tier: 'blue', owner: 'player', hexId: '4,5', hp: 120, atk: 35, speed: 0.8, range: [1.5, 3.0], trait: 'range_swap', moveProgress: 0, attackCd: 0 },
+    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,3', hp: 120, atk: 15, speed: 0.4, range: 0, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
+  ]
+  CombatSystem.tick(u5a, t5a)
+  const dmgBlueRanged = CombatSystem.calcDamage(35, 'blue', 'green')
+  console.assert(u5a[1].hp === 120 - dmgBlueRanged,
+    `blue ranged @2 hex: hp should be ${120 - dmgBlueRanged}, got ${u5a[1].hp}`)
+
+  const t5b = freshTiles(); resetAll()
+  t5b['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened' }
+  t5b['4,4'] = { q: 4, r: 4, owner: 'ai', state: 'opened' }
+  const u5b = [
+    { key: 'archer', tier: 'blue', owner: 'player', hexId: '4,5', hp: 120, atk: 35, speed: 0.8, range: [1.5, 3.0], trait: 'range_swap', moveProgress: 0, attackCd: 0 },
+    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,4', hp: 120, atk: 15, speed: 0.4, range: 0, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
+  ]
+  CombatSystem.tick(u5b, t5b)
+  const dmgBlueMelee = CombatSystem.calcDamage(35, 'blue', 'green')
+  console.assert(u5b[1].hp === 120 - dmgBlueMelee,
+    `blue melee @1 hex: hp should be ${120 - dmgBlueMelee}, got ${u5b[1].hp}`)
+
+  // === 6. 金阶 AOE 溅射：目标周围 1.5 格内敌方受 50% 伤害 ===
+  const t6 = freshTiles(); resetAll()
+  t6['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened' }
+  t6['4,3'] = { q: 4, r: 3, owner: 'ai', state: 'opened' }
+  t6['5,3'] = { q: 5, r: 3, owner: 'ai', state: 'opened' }
+  t6['4,4'] = { q: 4, r: 4, owner: 'ai', state: 'opened' }
+  const u6 = [
+    { key: 'dragon', tier: 'gold', owner: 'player', hexId: '4,5', hp: 300, atk: 60, speed: 0.6, range: 5.5, trait: 'aoe_cd_melee', moveProgress: 0, attackCd: 0, mode: 'ranged' },
+    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,3', hp: 300, atk: 15, speed: 0.4, range: 0, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 },
+    { key: 'wolf', tier: 'green', owner: 'ai', hexId: '4,4', hp: 80, atk: 25, speed: 0.8, range: 0, trait: 'melee_fast', moveProgress: 0, attackCd: 10 },
+    { key: 'wolf', tier: 'green', owner: 'ai', hexId: '5,3', hp: 200, atk: 25, speed: 0.8, range: 0, trait: 'melee_fast', moveProgress: 0, attackCd: 10 }
+  ]
+  CombatSystem.tick(u6, t6)
+  const dmgGoldSplash = Math.round(CombatSystem.calcDamage(60, 'gold', 'green') * 0.5)
+  console.assert(u6.length === 3, `wolf@4,4 one-shot removed, got ${u6.length} units`)
+  const sk6 = u6.find(u => u.hexId === '4,3')
+  console.assert(sk6 && sk6.hp === 300 - dmgGoldSplash,
+    `splash onto skeleton should deal ${dmgGoldSplash}, hp=${sk6 && sk6.hp}`)
+  console.assert(u6[0].mode === 'melee', 'gold switches to melee after ranged')
+
+  // === 7. 金阶近战模式无 AOE ===
+  const t7 = freshTiles(); resetAll()
+  t7['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened' }
+  t7['4,4'] = { q: 4, r: 4, owner: 'ai', state: 'opened' }
+  t7['6,4'] = { q: 6, r: 4, owner: 'ai', state: 'opened' }
+  const u7 = [
+    { key: 'dragon', tier: 'gold', owner: 'player', hexId: '4,5', hp: 300, atk: 60, speed: 0.6, range: 5.5, trait: 'aoe_cd_melee', moveProgress: 0, attackCd: 0, mode: 'melee' },
+    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,4', hp: 120, atk: 15, speed: 0.4, range: 0, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 },
+    { key: 'wolf', tier: 'green', owner: 'ai', hexId: '6,4', hp: 80, atk: 25, speed: 0.8, range: 0, trait: 'melee_fast', moveProgress: 0, attackCd: 10 }
+  ]
+  CombatSystem.tick(u7, t7)
+  const wolf7 = u7.find(u => u.hexId === '6,4')
+  console.assert(wolf7 && wolf7.hp === 80, 'melee mode should NOT splash; wolf @6,4 remains hp=80')
+
+  // === 8. 金阶 CD 结束切回远程模式 ===
+  const t8 = freshTiles(); resetAll()
+  t8['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened' }
+  const u8 = [
+    { key: 'dragon', tier: 'gold', owner: 'player', hexId: '4,5', hp: 300, atk: 60, speed: 0.6, range: 5.5, trait: 'aoe_cd_melee', moveProgress: 0, attackCd: 1, mode: 'melee' }
+  ]
+  CombatSystem.tick(u8, t8)
+  console.assert(u8[0].mode === 'ranged', 'gold switches to ranged when CD reaches 0')
+  console.assert(u8[0].attackCd === 0, 'attackCd should be 0')
+
+  // === 9. 50 金箭塔：射程 3.5 / ATK 35 ===
+  const t9 = freshTiles(); resetAll()
+  t9['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened',
+    building: { type: 'archer_tower', priceTier: 50, hp: 250, maxHp: 250 } }
+  t9['4,3'] = { q: 4, r: 3, owner: 'ai', state: 'opened' }
+  const u9 = [
+    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,3', hp: 120, atk: 15, speed: 0.4, range: 1.2, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
+  ]
+  CombatSystem.tick(u9, t9)
+  console.assert(u9[0].hp === 120 - 35, `tower 50 deals 35, hp=${u9[0].hp}`)
+
+  // === 10. 100 金箭塔：射程 5.0 / ATK 50 ===
+  const t10 = freshTiles(); resetAll()
+  t10['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened',
+    building: { type: 'archer_tower', priceTier: 100, hp: 350, maxHp: 350 } }
+  t10['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened' }
+  const u10 = [
+    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,1', hp: 120, atk: 15, speed: 0.4, range: 1.2, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
+  ]
+  CombatSystem.tick(u10, t10)
+  console.assert(u10[0].hp === 120 - 50, `tower 100 at 4 hex deals 50, hp=${u10[0].hp}`)
+
+  // === 11. HQ 射程 6.5 / ATK 50 ===
+  const t11 = freshTiles(); resetAll()
+  t11['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened',
+    building: { type: 'hq', hp: 1000, maxHp: 1000 } }
+  t11['4,5'] = { q: 4, r: 5, owner: 'ai', state: 'opened' }
+  const u11 = [
+    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,5', hp: 120, atk: 15, speed: 0.4, range: 1.2, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
+  ]
+  CombatSystem.tick(u11, t11)
+  console.assert(u11[0].hp === 120 - 50, `HQ at 6 hex deals 50, hp=${u11[0].hp}`)
+
+  // === 12. 建筑 HP 归零变废墟 + 领地变色 ===
+  const t12 = freshTiles(); resetAll()
+  t12['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened' }
+  t12['4,10'] = { q: 4, r: 10, owner: 'ai', state: 'opened',
+    building: { type: 'gold_mine', hp: 10, maxHp: 150 } }
+  TerritorySystem.claim('4,10', 'ai', t12, SeededRNG)
+  const u12 = [
+    { key: 'skeleton', tier: 'green', owner: 'player', hexId: '4,11', hp: 120, atk: 15, speed: 0.4, range: 1.2, trait: 'melee_tanky', moveProgress: 0, attackCd: 0 }
+  ]
+  CombatSystem.tick(u12, t12)
+  console.assert(t12['4,10'].ruin === true, 'building hp<=0 becomes ruin')
+  console.assert(t12['4,10'].building === null, 'ruin has building=null')
+  console.assert(RuinSystem.isRuin('4,10') === true, 'RuinSystem.isRuin true')
+  console.assert(TerritorySystem.owners['4,10'] === 'player', 'ruin flips to attacker color')
+
+  // === 13. 兵营被摧毁后停止吐兵 ===
+  const t13 = freshTiles(); resetAll()
+  t13['4,10'] = { q: 4, r: 10, owner: 'ai', state: 'opened',
+    building: { type: 'barracks', tier: 'green', hp: 200, maxHp: 200 } }
+  BarracksSystem.registerBarracks('4,10')
+  console.assert(BarracksSystem.timers['4,10'] !== undefined, 'barracks registered')
+  RuinSystem.createRuin('4,10', t13)
+  console.assert(BarracksSystem.timers['4,10'] === undefined, 'timer removed on ruin')
+  console.assert(t13['4,10'].building === null, 'ruin tile loses building')
+
+  // === 14. 单位 HP 归零被移除 ===
+  const t14 = freshTiles(); resetAll()
+  t14['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened' }
+  t14['4,4'] = { q: 4, r: 4, owner: 'ai', state: 'opened' }
+  const u14 = [
+    { key: 'dragon', tier: 'gold', owner: 'player', hexId: '4,5', hp: 300, atk: 60, speed: 0.6, range: 5.5, trait: 'aoe_cd_melee', moveProgress: 0, attackCd: 0, mode: 'ranged' },
+    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,4', hp: 10, atk: 15, speed: 0.4, range: 0, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
+  ]
+  CombatSystem.tick(u14, t14)
+  console.assert(u14.length === 1, `dead unit removed, got ${u14.length}`)
+  console.assert(u14[0].tier === 'gold', 'survivor is gold')
+
+  // === 15. 攻击 CD 1 次/秒（10 ticks）===
+  const t15 = freshTiles(); resetAll()
+  t15['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened' }
+  t15['4,4'] = { q: 4, r: 4, owner: 'ai', state: 'opened' }
+  const u15 = [
+    { key: 'skeleton', tier: 'green', owner: 'player', hexId: '4,5', hp: 120, atk: 15, speed: 0.4, range: 1.2, trait: 'melee_tanky', moveProgress: 0, attackCd: 0 },
+    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,4', hp: 200, atk: 15, speed: 0.4, range: 0, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
+  ]
+  CombatSystem.tick(u15, t15)
+  const hpAfter1 = u15[1].hp
+  for (let i = 0; i < 5; i++) CombatSystem.tick(u15, t15)
+  console.assert(u15[1].hp === hpAfter1, 'no damage during CD (5 ticks)')
+  for (let i = 0; i < 4; i++) CombatSystem.tick(u15, t15)
+  console.assert(u15[1].hp === hpAfter1, 'still on CD at tick 9')
+  CombatSystem.tick(u15, t15)
+  console.assert(u15[1].hp === hpAfter1 - 15,
+    `after 11 total ticks (10-tick gap), attacks again; hp=${u15[1].hp}`)
+
+  // === 16. 废墟连锁：占领后方后废墟变回我方（但仍是废墟）===
+  const t16 = freshTiles(); resetAll()
+  t16['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened' }
+  t16['4,4'] = { q: 4, r: 4, owner: 'ai', state: 'opened', ruin: true, building: null }
+  t16['4,3'] = { q: 4, r: 3, owner: 'ai', state: 'opened',
+    building: { type: 'gold_mine', hp: 150, maxHp: 150 } }
+  RuinSystem.ruins['4,4'] = true
+  TerritorySystem.claim('4,4', 'ai', t16, SeededRNG)
+  TerritorySystem.claim('4,3', 'ai', t16, SeededRNG)
+  TerritorySystem.claim('4,3', 'player', t16, SeededRNG)
+  TerritorySystem.claim('4,4', 'player', t16, SeededRNG)
+  console.assert(TerritorySystem.owners['4,4'] === 'player', 'ruin flips to player after chain')
+  console.assert(t16['4,4'].ruin === true, 'ruin flag persists')
+  console.assert(RuinSystem.isRuin('4,4') === true, 'RuinSystem still reports as ruin')
+
+  console.log('[test] CombatSystem tests passed')
+})()
+
+// ============================================================
+// testRuinSystem: 废墟生命周期
+// ============================================================
+;(function testRuinSystem() {
+  function freshTiles() {
+    const tiles = {}
+    for (let r = 0; r < HexGrid.ROWS; r++) {
+      for (let q = 0; q < HexGrid.COLS; q++) {
+        tiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+      }
+    }
+    return tiles
+  }
+
+  // === 1. createRuin 设置 ruin=true, 清空 building ===
+  const tiles1 = freshTiles()
+  RuinSystem.init()
+  BarracksSystem.init()
+  tiles1['4,5'] = { q: 4, r: 5, owner: 'ai', state: 'opened',
+    building: { type: 'gold_mine', hp: 0, maxHp: 150 } }
+  RuinSystem.createRuin('4,5', tiles1)
+  console.assert(tiles1['4,5'].ruin === true, 'tile.ruin flag should be true')
+  console.assert(tiles1['4,5'].building === null, 'building should be cleared on ruin')
+  console.assert(RuinSystem.isRuin('4,5') === true, 'RuinSystem.isRuin should be true')
+
+  // === 2. isRuin 默认 false ===
+  console.assert(RuinSystem.isRuin('0,0') === false, 'non-ruin hex returns false')
+  console.assert(RuinSystem.isRuin('99,99') === false, 'nonexistent hex returns false')
+
+  // === 3. clear 移除废墟 ===
+  RuinSystem.clear('4,5')
+  console.assert(RuinSystem.isRuin('4,5') === false, 'after clear, isRuin should be false')
+
+  // === 4. 兵营变废墟时自动 unregister ===
+  const tiles4 = freshTiles()
+  RuinSystem.init()
+  BarracksSystem.init()
+  tiles4['4,5'] = { q: 4, r: 5, owner: 'ai', state: 'opened',
+    building: { type: 'barracks', tier: 'green', hp: 0, maxHp: 200 } }
+  BarracksSystem.registerBarracks('4,5')
+  console.assert(BarracksSystem.timers['4,5'] !== undefined, 'barracks registered')
+  RuinSystem.createRuin('4,5', tiles4)
+  console.assert(BarracksSystem.timers['4,5'] === undefined,
+    'barracks timer removed on ruin')
+
+  // === 5. init 清空废墟字典 ===
+  RuinSystem.createRuin('4,5', tiles4)
+  RuinSystem.init()
+  console.assert(RuinSystem.isRuin('4,5') === false,
+    'RuinSystem.init should clear ruins')
+
+  console.log('[test] RuinSystem tests passed')
+})()
+
+// 测试会重置全局系统，重新初始化游戏状态
+gameState = initGameState()
 
 </script>
 </body>
