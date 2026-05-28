@@ -135,13 +135,14 @@ initGameState() → main loop → UI/render → click handling → tests
 <!-- Keep updated, max ~8-9 entries -->
 - **Playwright browser_click params:** `browser_click` requires `element` (description) and `target` (snapshot ref), not `ref`. Wrong param → `expected string, received undefined`, causes retry loop in auto mode.
 - **Initialization order conflict:** `initGameState()` before module definitions → `Cannot access before initialization`. 修复：严格按上文 "v2 推荐模块顺序" 在 GameState init 之前插入模块。
-- **renderUnits/renderBuildings missing closing brace:** New render functions often miss the function-level `}` (only closing the for-loop). Check bracket matching.
 - **GameLoop assertion timing:** `console.assert(tickCount > 0)` fails synchronously — use `setTimeout(..., 200)`.
 - **v2 格子状态机易混淆：** 格子有 3 种状态（未激活 / 可开 / 已开）× 4 种图标（? / 头盔 / 盾牌 / 金属）× 多种已开结果。状态转换必须单向，回退会引发 bug。
 - **v2 混合池 + 二次概率的 seed 管理：** 随机分两层（混合池选图标 → 档位选品质），必须用同一个 seeded RNG 实例贯穿两层，否则 replay 不可复现。
-- **v2 HexGrid flat-top 坐标 parity 易错：** `axialToPixel` 用 `sqrt(3)/2 * r` 隐式实现 RedBlob 的 odd-r 约定（奇数行右移半格），但 even/odd 行的 6 向邻居偏移集合不同。改邻居或寻路前**先用 `Math.hypot` 实测像素距离**（距离 ≈ size·√3 的才是真邻居，2·size 的不是），不要信记忆里的 offset 表——实测 `(0,0)` 偶数行有 3 邻居，`(0,1)` 奇数行也有 3 邻居，但偏移模式完全不同。
+- **v2 HexGrid flat-top 坐标 parity 易错：** `axialToPixel` 用 `sqrt(3)/2 * r` 隐式实现 RedBlob 的 odd-r 约定（奇数行右移半格），但 even/odd 行的 6 向邻居偏移集合不同。改邻居或寻路前**先用 `Math.hypot` 实测像素距离**（距离 ≈ size·√3 的才是真邻居，2·size 的不是），不要信记忆里的 offset 表。
 - **v2 pixelToAxial 不应 clamp：** `findHexAt` 要能检测"点击在画布空白处"，`pixelToAxial` 必须保留 cube rounding 的原始 (q, r)，**不要在内部 clamp 到 `[0, COLS)`/`[0, ROWS)`**——否则越界像素会被强制映到边缘格子，`findHexAt` 永远返回非 null。边界检查只在 `findHexAt` 里做一次。
-- **v2 湖水行没有良定义的像素位置：** `axialToPixel(q, LAKE_ROW)` 数学上能算出值，但那是"视觉间隔"的中线，不是真正格子中心。依赖"湖水格像素坐标"的测试（如 `findHexAt(axialToPixel(4,6))`）很脆——pixelToAxial 在该 y 处是奇点，会跳到 r=5 或 r=7。**测试湖水相关点击应改用"远离湖水的越界像素"**（如 `(100, 600)` / `(1200, 200)`）。
+- **v2 HQ 不能放在地图边缘行：** HexGrid 9×13 中 r=0 和 r=12 是边缘行，HQ 在这些位置只有 4 个邻居（而非 6 个），导致 OpeningLayout 无法生成完整的 6 格开局。**HQ 应放在 r=1 和 r=11（或更内侧）**，确保 6 个邻居都在界内。
+- **v2 OpeningLayout 金矿概率数学：** P(≥1 金矿 in 6 slots) = 1 - (1-p)^6。要得到 70%，需 p ≈ 18%（即 0.82^6 ≈ 0.30），**不是**直觉上的 35%（0.65^6 ≈ 0.075，实际给 92.5%）。指数衰减很容易误算，改权重前先手算验证。
+- **v2 统计测试必须用 SeededRNG：** 简单 LCG mock `(s * 1103515245 + 12345) & 0x7fffffff` 低位比特周期短，weightedPick 分布严重偏移（如预期 70% 金矿实测 93%）。统计检验**必须用 SeededRNG（mulberry32）+ 不同 seed**，不要用临时 LCG mock。
 
 ## Core Numbers
 
