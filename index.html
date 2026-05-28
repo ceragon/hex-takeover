@@ -26,7 +26,11 @@
 </head>
 <body>
 
-<canvas id="game-canvas" width="560" height="460"></canvas>
+<canvas id="game-canvas" width="560" height="540"></canvas>
+<div id="ui-bar" style="margin-top:8px;font-size:14px;display:flex;gap:32px;">
+  <span id="player-gold" style="color:#6af;">己方金币: 60</span>
+  <span id="ai-gold" style="color:#f66;">敌方金币: 60</span>
+</div>
 
 <script>
 // ============================================================
@@ -161,22 +165,213 @@ const HexGrid = {
 }
 
 // ============================================================
-// v2 Slice 1: GameState（最小可运行骨架）
-// 仅保留地图格子与双方 HQ 位置，供渲染与点击使用
-// 完整 TileSystem / ResourceSystem / BarracksSystem 将在后续切片加入
+// SeededRNG: mulberry32 seeded PRNG，单例贯穿所有随机源
 // ============================================================
-const PLAYER_HQ = { q: 4, r: 12 }
-const AI_HQ = { q: 4, r: 0 }
+const SeededRNG = {
+  seed: 42,
+  _state: 42,
+
+  init(seed) {
+    this.seed = seed
+    this._state = seed | 0
+    if (this._state === 0) this._state = 1
+  },
+
+  next() {
+    let t = this._state += 0x6D2B79F5
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  },
+
+  nextFloat() { return this.next() },
+
+  nextInt(min, max) {
+    return Math.floor(this.next() * (max - min + 1)) + min
+  },
+
+  weightedPick(options, weights) {
+    const total = weights.reduce((a, b) => a + b, 0)
+    let r = this.next() * total
+    for (let i = 0; i < options.length; i++) {
+      r -= weights[i]
+      if (r < 0) return options[i]
+    }
+    return options[options.length - 1]
+  },
+
+  shuffle(arr) {
+    const result = [...arr]
+    for (let i = result.length - 1; i > 0; i--) {
+      const j = Math.floor(this.next() * (i + 1))
+      ;[result[i], result[j]] = [result[j], result[i]]
+    }
+    return result
+  }
+}
+
+// ============================================================
+// TileSystem: 格子状态机（inactive → openable → opened）
+// 混合池图标分配 + 档位差异化价格 + 激活判定
+// ============================================================
+const TileSystem = {
+  ICONS: ['?', 'helmet', 'shield', 'metal'],
+  ICON_WEIGHTS: [55, 25, 10, 10],
+
+  PRICE_BY_ICON: {
+    '?':      [25, 50, 100, 250],
+    'helmet': [25, 50, 100, 250],
+    'shield': [25, 50, 100, 250],
+    'metal':  [25, 50, 100, 250]
+  },
+
+  PRICE_WEIGHTS_BY_ICON: {
+    '?':      [60, 25, 10, 5],
+    'helmet': [10, 40, 35, 15],
+    'shield': [5, 35, 45, 15],
+    'metal':  [10, 55, 25, 10]
+  },
+
+  assignTileRng(rng) {
+    const icon = rng.weightedPick(this.ICONS, this.ICON_WEIGHTS)
+    const prices = this.PRICE_BY_ICON[icon]
+    const weights = this.PRICE_WEIGHTS_BY_ICON[icon]
+    const price = rng.weightedPick(prices, weights)
+    return { icon, price }
+  },
+
+  activateOpenableTiles(tiles, rng) {
+    const activated = []
+    for (const hexId of Object.keys(tiles)) {
+      const tile = tiles[hexId]
+      if (tile.state !== 'inactive') continue
+      const neighbors = HexGrid.getNeighbors(tile.q, tile.r)
+      const adjToOwned = neighbors.some(n => {
+        const nt = tiles[`${n.q},${n.r}`]
+        return nt && (nt.owner === 'player' || nt.owner === 'ai')
+      })
+      if (adjToOwned) {
+        const { icon, price } = this.assignTileRng(rng)
+        tile.state = 'openable'
+        tile.icon = icon
+        tile.price = price
+        activated.push(hexId)
+      }
+    }
+    return activated
+  }
+}
+
+// ============================================================
+// OpeningLayout: 开局 HQ 周围 6 格随机填入建筑
+// 建筑池：兵营 54% / 箭塔 28% / 金矿 18%
+// P(≥1 金矿) = 1 - 0.82^6 ≈ 70%
+// ============================================================
+const OpeningLayout = {
+  BUILDING_OPTIONS: ['barracks', 'archer_tower', 'gold_mine'],
+  BUILDING_WEIGHTS: [54, 28, 18],
+
+  generateOpening(hq, tiles, rng) {
+    const neighbors = HexGrid.getNeighbors(hq.q, hq.r)
+    const slots = neighbors.filter(n =>
+      HexGrid.isInBounds(n.q, n.r) && !HexGrid.isLake(n.q, n.r)
+    )
+
+    const results = []
+    for (const slot of slots) {
+      results.push(rng.weightedPick(this.BUILDING_OPTIONS, this.BUILDING_WEIGHTS))
+    }
+
+    for (let i = 0; i < slots.length; i++) {
+      const { q, r } = slots[i]
+      const hexId = `${q},${r}`
+      tiles[hexId] = {
+        q, r,
+        owner: hq.owner,
+        state: 'opened',
+        building: { type: results[i] }
+      }
+    }
+
+    return results
+  }
+}
+
+// ============================================================
+// ResourceSystem: 双方金币管理、HQ/金矿产金、花费校验
+// ============================================================
+const ResourceSystem = {
+  gold: { player: 60, ai: 60 },
+  incomeTick: 0,
+  INCOME_INTERVAL: 60,
+
+  init() {
+    this.gold = { player: 60, ai: 60 }
+    this.incomeTick = 0
+  },
+
+  trySpend(player, amount) {
+    if (amount <= 0 || this.gold[player] < amount) return false
+    this.gold[player] -= amount
+    return true
+  },
+
+  addGold(player, amount) {
+    this.gold[player] += amount
+  },
+
+  countMines(tiles, owner) {
+    let count = 0
+    for (const hexId of Object.keys(tiles)) {
+      const tile = tiles[hexId]
+      if (tile.owner === owner && tile.state === 'opened'
+          && tile.building && tile.building.type === 'gold_mine') {
+        count++
+      }
+    }
+    return count
+  },
+
+  tick(tiles) {
+    this.incomeTick++
+    if (this.incomeTick >= this.INCOME_INTERVAL) {
+      this.incomeTick = 0
+      for (const side of ['player', 'ai']) {
+        this.gold[side] += 12
+        this.gold[side] += this.countMines(tiles, side) * 10
+      }
+    }
+  }
+}
+
+// ============================================================
+// v2 Slice 2: GameState（格子状态机 + 开局布局 + 经济系统）
+// ============================================================
+const PLAYER_HQ = { q: 4, r: 11, owner: 'player' }
+const AI_HQ = { q: 4, r: 1, owner: 'ai' }
 
 function initGameState() {
+  SeededRNG.init(42)
+
   const tiles = {}
   for (let r = 0; r < HexGrid.ROWS; r++) {
     for (let q = 0; q < HexGrid.COLS; q++) {
-      tiles[`${q},${r}`] = { q, r, owner: null }
+      tiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
     }
   }
-  tiles[`${PLAYER_HQ.q},${PLAYER_HQ.r}`].owner = 'player'
-  tiles[`${AI_HQ.q},${AI_HQ.r}`].owner = 'ai'
+
+  const playerHqId = `${PLAYER_HQ.q},${PLAYER_HQ.r}`
+  const aiHqId = `${AI_HQ.q},${AI_HQ.r}`
+  tiles[playerHqId] = { q: PLAYER_HQ.q, r: PLAYER_HQ.r, owner: 'player', state: 'opened', building: { type: 'hq' } }
+  tiles[aiHqId] = { q: AI_HQ.q, r: AI_HQ.r, owner: 'ai', state: 'opened', building: { type: 'hq' } }
+
+  OpeningLayout.generateOpening(PLAYER_HQ, tiles, SeededRNG)
+  OpeningLayout.generateOpening(AI_HQ, tiles, SeededRNG)
+
+  ResourceSystem.init()
+
+  TileSystem.activateOpenableTiles(tiles, SeededRNG)
+
   return { tiles }
 }
 
@@ -218,11 +413,11 @@ function drawHexLabel(cx, cy, text, fontSize = 10, color = '#fff') {
 
 function renderGrid() {
   const size = HexGrid.hexSize
+  const tiles = gameState.tiles
 
   ctx.fillStyle = '#0a0a1a'
   ctx.fillRect(0, 0, canvas.width, canvas.height)
 
-  // 湖水带：在 LAKE_ROW 的垂直位置画一条贯穿的蓝色条
   const lakeY = HexGrid.axialToPixel(0, HexGrid.LAKE_ROW).y
   const lakeBandHeight = size * Math.sqrt(3) * 0.5
   ctx.fillStyle = '#1e3a5f'
@@ -234,28 +429,62 @@ function renderGrid() {
       const { x, y } = HexGrid.axialToPixel(q, r)
       const cx = x + RENDER_OFFSET.x
       const cy = y + RENDER_OFFSET.y
+      const hexId = `${q},${r}`
+      const tile = tiles[hexId]
 
       let color = '#3a3a5a'
-      if (q === PLAYER_HQ.q && r === PLAYER_HQ.r) color = '#2266cc'
-      else if (q === AI_HQ.q && r === AI_HQ.r) color = '#cc2222'
+      let label = ''
+      let labelSize = 10
+      let subLabel = ''
+
+      if (tile.state === 'opened' && tile.building) {
+        if (tile.building.type === 'hq') {
+          color = tile.owner === 'player' ? '#2266cc' : '#cc2222'
+          label = tile.owner === 'player' ? '己方HQ' : '敌方HQ'
+          labelSize = 9
+        } else if (tile.building.type === 'barracks') {
+          color = tile.owner === 'player' ? '#1a5a2a' : '#5a1a1a'
+          label = '兵'
+        } else if (tile.building.type === 'archer_tower') {
+          color = tile.owner === 'player' ? '#1a4a3a' : '#4a1a2a'
+          label = '塔'
+        } else if (tile.building.type === 'gold_mine') {
+          color = tile.owner === 'player' ? '#4a4a1a' : '#4a2a1a'
+          label = '矿'
+        }
+      } else if (tile.state === 'opened') {
+        color = '#2a2a3a'
+        label = '空'
+      } else if (tile.state === 'openable') {
+        color = '#4a3a6a'
+        const iconMap = { '?': '?', 'helmet': '盔', 'shield': '盾', 'metal': '金' }
+        label = iconMap[tile.icon] || '?'
+        subLabel = `${tile.price}`
+      } else {
+        color = '#222233'
+      }
 
       drawHex(cx, cy, size - 1, color)
-
-      if (q === PLAYER_HQ.q && r === PLAYER_HQ.r) {
-        drawHexLabel(cx, cy, '己方HQ', 9, '#fff')
-      } else if (q === AI_HQ.q && r === AI_HQ.r) {
-        drawHexLabel(cx, cy, '敌方HQ', 9, '#fff')
-      }
+      if (label) drawHexLabel(cx, cy - (subLabel ? 4 : 0), label, labelSize, '#fff')
+      if (subLabel) drawHexLabel(cx, cy + 8, subLabel, 8, '#ffcc44')
     }
   }
 }
 
+function updateUI() {
+  const pg = document.getElementById('player-gold')
+  const ag = document.getElementById('ai-gold')
+  if (pg) pg.textContent = `己方金币: ${ResourceSystem.gold.player}`
+  if (ag) ag.textContent = `敌方金币: ${ResourceSystem.gold.ai}`
+}
+
 function render() {
   renderGrid()
+  updateUI()
 }
 
 // ============================================================
-// Click handling（slice 1：仅做命中检测，湖水格无反应）
+// Click handling（slice 2：仅做命中检测 + 格子状态日志）
 // ============================================================
 canvas.addEventListener('click', (event) => {
   const rect = canvas.getBoundingClientRect()
@@ -264,7 +493,8 @@ canvas.addEventListener('click', (event) => {
 
   const hex = HexGrid.findHexAt(mx, my)
   if (!hex) return
-  console.log(`[click] 命中格子 q=${hex.q}, r=${hex.r}`)
+  const tile = gameState.tiles[`${hex.q},${hex.r}`]
+  console.log(`[click] q=${hex.q}, r=${hex.r} state=${tile ? tile.state : '?'}`)
 })
 
 // ============================================================
@@ -272,6 +502,7 @@ canvas.addEventListener('click', (event) => {
 // ============================================================
 const gameLoop = createGameLoop(() => {
   tickCount++
+  ResourceSystem.tick(gameState.tiles)
 })
 
 render()
@@ -363,6 +594,394 @@ gameLoop.start()
     `中心 30% 偏移应仍命中 (4,3)，实际 (${near && near.q},${near && near.r})`)
 
   console.log('[test] HexGrid v2 (9×12+lake) tests passed')
+})()
+
+// ============================================================
+// SeededRNG tests
+// ============================================================
+;(function testSeededRNG() {
+  // 1. 同 seed 产生相同序列
+  SeededRNG.init(12345)
+  const a = [SeededRNG.next(), SeededRNG.next(), SeededRNG.next()]
+  SeededRNG.init(12345)
+  const b = [SeededRNG.next(), SeededRNG.next(), SeededRNG.next()]
+  console.assert(a[0] === b[0] && a[1] === b[1] && a[2] === b[2],
+    '同 seed 应产生相同序列')
+
+  // 2. 不同 seed 产生不同序列
+  SeededRNG.init(1)
+  const c = SeededRNG.next()
+  SeededRNG.init(2)
+  const d = SeededRNG.next()
+  console.assert(c !== d, '不同 seed 应产生不同值')
+
+  // 3. 值域 [0, 1)
+  SeededRNG.init(99999)
+  let inRange = true
+  for (let i = 0; i < 10000; i++) {
+    const v = SeededRNG.next()
+    if (v < 0 || v >= 1) { inRange = false; break }
+  }
+  console.assert(inRange, 'next() 应始终在 [0, 1) 范围内')
+
+  // 4. weightedPick 分布检验
+  SeededRNG.init(42)
+  const counts = { a: 0, b: 0, c: 0 }
+  const N = 10000
+  for (let i = 0; i < N; i++) {
+    const pick = SeededRNG.weightedPick(['a', 'b', 'c'], [70, 20, 10])
+    counts[pick]++
+  }
+  console.assert(counts.a / N > 0.60 && counts.a / N < 0.80,
+    `weightedPick a 应约 70%，实际 ${(counts.a / N * 100).toFixed(1)}%`)
+  console.assert(counts.c / N > 0.05 && counts.c / N < 0.15,
+    `weightedPick c 应约 10%，实际 ${(counts.c / N * 100).toFixed(1)}%`)
+
+  // 5. shuffle 保持元素集合不变
+  SeededRNG.init(777)
+  const original = [1, 2, 3, 4, 5]
+  const shuffled = SeededRNG.shuffle(original)
+  console.assert(shuffled.length === 5, 'shuffle 长度不变')
+  console.assert(shuffled.every(v => original.includes(v)), 'shuffle 元素集合不变')
+  console.assert(original[0] === 1 && original[4] === 5, 'shuffle 不修改原数组')
+
+  // 6. nextInt 范围检验
+  SeededRNG.init(31415)
+  let intOk = true
+  for (let i = 0; i < 1000; i++) {
+    const v = SeededRNG.nextInt(0, 5)
+    if (v < 0 || v > 5 || !Number.isInteger(v)) { intOk = false; break }
+  }
+  console.assert(intOk, 'nextInt(0, 5) 应在 [0, 5] 整数范围内')
+
+  console.log('[test] SeededRNG tests passed')
+})()
+
+// ============================================================
+// TileSystem tests
+// ============================================================
+;(function testTileSystem() {
+  // 1. 状态机：inactive → openable 需要相邻己方领地
+  const mockRng = {
+    next() { return 0.5 },
+    weightedPick(options, weights) { return options[0] }
+  }
+  const testTiles = {
+    '4,11': { q: 4, r: 11, owner: 'player', state: 'opened' },
+    '3,11': { q: 3, r: 11, owner: null, state: 'inactive' },
+    '0,0': { q: 0, r: 0, owner: null, state: 'inactive' }
+  }
+  const activated = TileSystem.activateOpenableTiles(testTiles, mockRng)
+  console.assert(testTiles['3,11'].state === 'openable',
+    '相邻己方领地的 inactive 格应变为 openable')
+  console.assert(testTiles['0,0'].state === 'inactive',
+    '不相邻己方领地的 inactive 格应保持 inactive')
+
+  // 2. assignTileRng 返回有效 icon 和 price
+  SeededRNG.init(42)
+  const result = TileSystem.assignTileRng(SeededRNG)
+  console.assert(TileSystem.ICONS.includes(result.icon),
+    `icon 应为有效值，实际: ${result.icon}`)
+  console.assert([25, 50, 100, 250].includes(result.price),
+    `price 应为有效档位，实际: ${result.price}`)
+
+  // 3. 混合池权重分布（统计检验）
+  SeededRNG.init(42)
+  const iconCounts = { '?': 0, 'helmet': 0, 'shield': 0, 'metal': 0 }
+  const N = 10000
+  for (let i = 0; i < N; i++) {
+    const { icon } = TileSystem.assignTileRng(SeededRNG)
+    iconCounts[icon]++
+  }
+  console.assert(iconCounts['?'] / N > 0.48 && iconCounts['?'] / N < 0.62,
+    `? 应约 55%，实际 ${(iconCounts['?'] / N * 100).toFixed(1)}%`)
+  console.assert(iconCounts['helmet'] / N > 0.20 && iconCounts['helmet'] / N < 0.30,
+    `helmet 应约 25%，实际 ${(iconCounts['helmet'] / N * 100).toFixed(1)}%`)
+  console.assert(iconCounts['shield'] / N > 0.06 && iconCounts['shield'] / N < 0.14,
+    `shield 应约 10%，实际 ${(iconCounts['shield'] / N * 100).toFixed(1)}%`)
+  console.assert(iconCounts['metal'] / N > 0.06 && iconCounts['metal'] / N < 0.14,
+    `metal 应约 10%，实际 ${(iconCounts['metal'] / N * 100).toFixed(1)}%`)
+
+  // 4. 价格档位按图标类型差异化
+  SeededRNG.init(42)
+  const priceByicon = { '?': [], 'helmet': [], 'shield': [], 'metal': [] }
+  for (let i = 0; i < N; i++) {
+    const { icon, price } = TileSystem.assignTileRng(SeededRNG)
+    priceByicon[icon].push(price)
+  }
+  const qPctCheap = priceByicon['?'].filter(p => p === 25).length / priceByicon['?'].length
+  console.assert(qPctCheap > 0.50,
+    `? 应偏 25 金（>50%），实际 ${(qPctCheap * 100).toFixed(1)}%`)
+  const helmetPct50or100 = priceByicon['helmet'].filter(p => p === 50 || p === 100).length / priceByicon['helmet'].length
+  console.assert(helmetPct50or100 > 0.60,
+    `helmet 应偏 50/100 金（>60%），实际 ${(helmetPct50or100 * 100).toFixed(1)}%`)
+  const shieldPct50or100 = priceByicon['shield'].filter(p => p === 50 || p === 100).length / priceByicon['shield'].length
+  console.assert(shieldPct50or100 > 0.60,
+    `shield 应偏 50/100 金（>60%），实际 ${(shieldPct50or100 * 100).toFixed(1)}%`)
+  const metalPct50 = priceByicon['metal'].filter(p => p === 50).length / priceByicon['metal'].length
+  console.assert(metalPct50 > 0.40,
+    `metal 应偏 50 金（>40%），实际 ${(metalPct50 * 100).toFixed(1)}%`)
+
+  // 5. 状态机单向性：openable 和 opened 格不被重新激活
+  const testTiles2 = {
+    '4,11': { q: 4, r: 11, owner: 'player', state: 'opened' },
+    '3,11': { q: 3, r: 11, owner: null, state: 'openable', icon: '?', price: 25 },
+    '5,11': { q: 5, r: 11, owner: null, state: 'opened', building: { type: 'barracks' } }
+  }
+  TileSystem.activateOpenableTiles(testTiles2, mockRng)
+  console.assert(testTiles2['3,11'].icon === '?',
+    '已 openable 的格子不应被重新分配')
+  console.assert(testTiles2['5,11'].building.type === 'barracks',
+    '已 opened 的格子不应被修改')
+
+  console.log('[test] TileSystem tests passed')
+})()
+
+// ============================================================
+// OpeningLayout tests
+// ============================================================
+;(function testOpeningLayout() {
+  // 1. 开局生成 6 个已开建筑格
+  SeededRNG.init(42)
+  const testTiles = {}
+  for (let r = 0; r < HexGrid.ROWS; r++) {
+    for (let q = 0; q < HexGrid.COLS; q++) {
+      testTiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+    }
+  }
+  testTiles['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened', building: { type: 'hq' } }
+  const hq = { q: 4, r: 11, owner: 'player' }
+  const results = OpeningLayout.generateOpening(hq, testTiles, SeededRNG)
+  console.assert(results.length === 6,
+    `开局应生成 6 个建筑格，实际 ${results.length}`)
+
+  // 验证所有开局格子为 opened 且有 building
+  const neighbors = HexGrid.getNeighbors(4, 11)
+  let openedCount = 0
+  for (const n of neighbors) {
+    const tile = testTiles[`${n.q},${n.r}`]
+    if (tile && tile.state === 'opened' && tile.building) openedCount++
+  }
+  console.assert(openedCount === 6,
+    `HQ 周围应有 6 个 opened 建筑格，实际 ${openedCount}`)
+
+  // 2. 建筑类型全部有效
+  const validTypes = ['barracks', 'archer_tower', 'gold_mine']
+  console.assert(results.every(t => validTypes.includes(t)),
+    `所有建筑类型应有效，实际: ${results.join(', ')}`)
+
+  // 3. ≥1 金矿概率 70%（统计 1000 次，每次用不同 seed）
+  let mineCount = 0
+  const TRIALS = 1000
+  for (let trial = 0; trial < TRIALS; trial++) {
+    SeededRNG.init(trial * 7 + 13)
+    const freshTiles = {}
+    for (let r2 = 0; r2 < HexGrid.ROWS; r2++) {
+      for (let q2 = 0; q2 < HexGrid.COLS; q2++) {
+        freshTiles[`${q2},${r2}`] = { q: q2, r: r2, owner: null, state: 'inactive' }
+      }
+    }
+    freshTiles['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened', building: { type: 'hq' } }
+    const r = OpeningLayout.generateOpening(hq, freshTiles, SeededRNG)
+    if (r.some(b => b === 'gold_mine')) mineCount++
+  }
+  const mineRate = mineCount / TRIALS
+  console.assert(mineRate >= 0.65 && mineRate <= 0.75,
+    `≥1 金矿频率应在 65%-75%，实际 ${(mineRate * 100).toFixed(1)}%`)
+
+  // 4. 同 seed 结果一致
+  SeededRNG.init(999)
+  const tiles1 = {}
+  for (let r = 0; r < HexGrid.ROWS; r++) {
+    for (let q = 0; q < HexGrid.COLS; q++) {
+      tiles1[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+    }
+  }
+  tiles1['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened', building: { type: 'hq' } }
+  const res1 = OpeningLayout.generateOpening(hq, tiles1, SeededRNG)
+
+  SeededRNG.init(999)
+  const tiles2 = {}
+  for (let r = 0; r < HexGrid.ROWS; r++) {
+    for (let q = 0; q < HexGrid.COLS; q++) {
+      tiles2[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+    }
+  }
+  tiles2['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened', building: { type: 'hq' } }
+  const res2 = OpeningLayout.generateOpening(hq, tiles2, SeededRNG)
+  console.assert(JSON.stringify(res1) === JSON.stringify(res2),
+    '同 seed 开局结果应完全一致')
+
+  // 5. 双方独立生成
+  SeededRNG.init(42)
+  const tiles3 = {}
+  for (let r = 0; r < HexGrid.ROWS; r++) {
+    for (let q = 0; q < HexGrid.COLS; q++) {
+      tiles3[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+    }
+  }
+  tiles3['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened', building: { type: 'hq' } }
+  tiles3['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened', building: { type: 'hq' } }
+  OpeningLayout.generateOpening({ q: 4, r: 11, owner: 'player' }, tiles3, SeededRNG)
+  OpeningLayout.generateOpening({ q: 4, r: 1, owner: 'ai' }, tiles3, SeededRNG)
+  const aiNeighbors = HexGrid.getNeighbors(4, 1)
+  const aiOpened = aiNeighbors.filter(n => {
+    const t = tiles3[`${n.q},${n.r}`]
+    return t && t.state === 'opened' && t.owner === 'ai' && t.building
+  })
+  console.assert(aiOpened.length === 6,
+    `AI 方也应有 6 个 opened 建筑格，实际 ${aiOpened.length}`)
+
+  console.log('[test] OpeningLayout tests passed')
+})()
+
+// ============================================================
+// ResourceSystem tests
+// ============================================================
+;(function testResourceSystem() {
+  // 1. 初始金币 60
+  ResourceSystem.init()
+  console.assert(ResourceSystem.gold.player === 60,
+    `玩家初始金币应为 60，实际 ${ResourceSystem.gold.player}`)
+  console.assert(ResourceSystem.gold.ai === 60,
+    `AI 初始金币应为 60，实际 ${ResourceSystem.gold.ai}`)
+
+  // 2. trySpend 成功扣费
+  ResourceSystem.init()
+  const ok = ResourceSystem.trySpend('player', 30)
+  console.assert(ok === true, 'trySpend(30) 应返回 true')
+  console.assert(ResourceSystem.gold.player === 30,
+    `扣费后应为 30，实际 ${ResourceSystem.gold.player}`)
+
+  // 3. trySpend 金币不足返回 false，不扣费
+  const fail = ResourceSystem.trySpend('player', 50)
+  console.assert(fail === false, 'trySpend(50) 金币不足应返回 false')
+  console.assert(ResourceSystem.gold.player === 30,
+    `扣费失败后应仍为 30，实际 ${ResourceSystem.gold.player}`)
+
+  // 4. trySpend 金额为 0 或负数返回 false
+  console.assert(ResourceSystem.trySpend('player', 0) === false,
+    'trySpend(0) 应返回 false')
+  console.assert(ResourceSystem.trySpend('player', -10) === false,
+    'trySpend(-10) 应返回 false')
+
+  // 5. 双方独立金币池
+  ResourceSystem.init()
+  ResourceSystem.addGold('player', 100)
+  console.assert(ResourceSystem.gold.player === 160,
+    `addGold 后玩家应有 160，实际 ${ResourceSystem.gold.player}`)
+  console.assert(ResourceSystem.gold.ai === 60,
+    `addGold 不应影响 AI，实际 ${ResourceSystem.gold.ai}`)
+
+  // 6. HQ 产金：tick 60 次（6 秒）后增加 12
+  ResourceSystem.init()
+  ResourceSystem.incomeTick = 0
+  const emptyTiles = {}
+  for (let r = 0; r < HexGrid.ROWS; r++) {
+    for (let q = 0; q < HexGrid.COLS; q++) {
+      emptyTiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+    }
+  }
+  for (let i = 0; i < 60; i++) ResourceSystem.tick(emptyTiles)
+  console.assert(ResourceSystem.gold.player === 72,
+    `6s 后玩家金币应为 72（60+12），实际 ${ResourceSystem.gold.player}`)
+  console.assert(ResourceSystem.gold.ai === 72,
+    `6s 后 AI 金币应为 72（60+12），实际 ${ResourceSystem.gold.ai}`)
+
+  // 7. HQ + N 金矿产金
+  ResourceSystem.init()
+  ResourceSystem.incomeTick = 0
+  const mineTiles = {}
+  for (let r = 0; r < HexGrid.ROWS; r++) {
+    for (let q = 0; q < HexGrid.COLS; q++) {
+      mineTiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+    }
+  }
+  mineTiles['3,11'] = { q: 3, r: 11, owner: 'player', state: 'opened', building: { type: 'gold_mine' } }
+  mineTiles['5,11'] = { q: 5, r: 11, owner: 'player', state: 'opened', building: { type: 'gold_mine' } }
+  mineTiles['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened', building: { type: 'gold_mine' } }
+  for (let i = 0; i < 60; i++) ResourceSystem.tick(mineTiles)
+  console.assert(ResourceSystem.gold.player === 92,
+    `6s 后玩家金币应为 92（60+12+2*10），实际 ${ResourceSystem.gold.player}`)
+  console.assert(ResourceSystem.gold.ai === 82,
+    `6s 后 AI 金币应为 82（60+12+1*10），实际 ${ResourceSystem.gold.ai}`)
+
+  // 8. countMines 正确计数
+  const mines = ResourceSystem.countMines(mineTiles, 'player')
+  console.assert(mines === 2,
+    `玩家应有 2 个金矿，实际 ${mines}`)
+  const aiMines = ResourceSystem.countMines(mineTiles, 'ai')
+  console.assert(aiMines === 1,
+    `AI 应有 1 个金矿，实际 ${aiMines}`)
+
+  console.log('[test] ResourceSystem tests passed')
+})()
+
+// ============================================================
+// Integration test: initGameState seed determinism
+// ============================================================
+;(function testGameStateDeterminism() {
+  const gs1 = initGameState()
+  const gs2 = initGameState()
+
+  // 同 seed 重复开局，所有格子状态完全一致
+  let mismatch = 0
+  for (const hexId of Object.keys(gs1.tiles)) {
+    const t1 = gs1.tiles[hexId]
+    const t2 = gs2.tiles[hexId]
+    if (t1.state !== t2.state) mismatch++
+    if (t1.icon !== t2.icon) mismatch++
+    if (t1.price !== t2.price) mismatch++
+    if (t1.building && t2.building && t1.building.type !== t2.building.type) mismatch++
+  }
+  console.assert(mismatch === 0,
+    `同 seed 两次开局应完全一致，不匹配数: ${mismatch}`)
+
+  // 验证开局格子状态
+  const playerHqNeighbors = HexGrid.getNeighbors(PLAYER_HQ.q, PLAYER_HQ.r)
+  let playerOpenedBuildings = 0
+  for (const n of playerHqNeighbors) {
+    const tile = gs1.tiles[`${n.q},${n.r}`]
+    if (tile && tile.state === 'opened' && tile.building
+        && tile.building.type !== 'hq' && tile.owner === 'player') {
+      playerOpenedBuildings++
+    }
+  }
+  console.assert(playerOpenedBuildings === 6,
+    `玩家 HQ 周围应有 6 个已开建筑格，实际 ${playerOpenedBuildings}`)
+
+  const aiHqNeighbors = HexGrid.getNeighbors(AI_HQ.q, AI_HQ.r)
+  let aiOpenedBuildings = 0
+  for (const n of aiHqNeighbors) {
+    const tile = gs1.tiles[`${n.q},${n.r}`]
+    if (tile && tile.state === 'opened' && tile.building
+        && tile.building.type !== 'hq' && tile.owner === 'ai') {
+      aiOpenedBuildings++
+    }
+  }
+  console.assert(aiOpenedBuildings === 6,
+    `AI HQ 周围应有 6 个已开建筑格，实际 ${aiOpenedBuildings}`)
+
+  // 验证有 openable 格子（与已开领地相邻的 inactive 格被激活）
+  let openableCount = 0
+  for (const hexId of Object.keys(gs1.tiles)) {
+    if (gs1.tiles[hexId].state === 'openable') openableCount++
+  }
+  console.assert(openableCount > 0,
+    `开局后应有 openable 格子，实际 ${openableCount}`)
+
+  // 验证可开格子都有图标和价格
+  for (const hexId of Object.keys(gs1.tiles)) {
+    const tile = gs1.tiles[hexId]
+    if (tile.state === 'openable') {
+      console.assert(TileSystem.ICONS.includes(tile.icon),
+        `openable 格子 ${hexId} icon 无效: ${tile.icon}`)
+      console.assert([25, 50, 100, 250].includes(tile.price),
+        `openable 格子 ${hexId} price 无效: ${tile.price}`)
+    }
+  }
+
+  console.log('[test] GameState determinism + integration tests passed')
 })()
 </script>
 </body>
