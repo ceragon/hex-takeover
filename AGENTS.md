@@ -133,7 +133,7 @@ initGameState() → main loop → UI/render → click handling → tests
 ## Known Pitfalls
 
 <!-- Keep updated, max ~8-9 entries -->
-- **v2 HexGrid 实际是 pointy-top even-r 偏移：** `axialToPixel` 用 `(1.5 * r)` 公式是 pointy-top；cube distance 必须用 **even-r 偏移 `ax = q - floor(r/2)`**（不是 odd-r 的 `q + floor(r/2)`，AGENTS 曾误写为 odd-r）。`getNeighbors` 偏移表必须匹配 even-r 约定，否则邻居关系不对称。改偏移前**先用 `Math.hypot` 验证像素距离 = √3·size**。
+- **v2 TerritorySystem.owners 是领地唯一权威源（tile.owner 不可信）：** `TerritorySystem.claim` 只写 `owners[hexId] = owner`，**不**回写 `tile.owner`。测试用 `{ owner: null, ... }` 字面量构造 tile 后 `TerritorySystem.claim('4,5', 'ai', ...)` 只更新字典，`tile.owner` 仍是 null。遍历 `Object.keys(tiles)` 读 `tile.owner` 会漏掉所有通过 claim 翻转的领地。**修复：所有领地归属判断与翻转（如 VictorySystem._flipAllTerritory）必须遍历 `TerritorySystem.owners` 字典，不能读 `tile.owner`**。渲染代码若需按 owner 着色，也要从 `TerritorySystem.owners[hexId]` 取（HQ 等直接设置 tile.owner 的场景除外）。
 - **v2 湖水格必须可通行（视觉装饰而非移动屏障）：** 六边形邻居只覆盖 ±1 行，若 `getNeighbors` 和 BFS 过滤 r=LAKE_ROW，地图上下两半完全断开，单位无法跨越。**修复：`getNeighbors` 不再过滤湖水格，BFS 不再跳过湖水，渲染保留蓝色视觉带**。
 - **v2 computeBFS 返回的 path 包含目标格本身：** path[0] 是第一步，path[last] 是目标格。相邻目标返回 length=1（而非 0）。tick() 中 `path[0]` 是单位的下一步目标格。单位移动到敌方格子时触发 TerritorySystem.claim。
 - **v2 测试手动构造 unit 必须带 speed 字段：** MoveUnits.tick 读 `unit.speed` 计算 `moveProgress += speed/10`。遗漏 speed → `undefined/10 = NaN` → moveProgress 永远 NaN → 单位不动。**修复：测试 unit 字面量必须含 `speed: UnitTypes.get(key).speed`**。
@@ -141,7 +141,7 @@ initGameState() → main loop → UI/render → click handling → tests
 - **v2 building.attackCd NaN 陷阱：** 建筑 attackCd 初始是 `undefined`，`Math.max(0, undefined - 1) = NaN`，之后 `NaN > 0` 为 false，导致箭塔/HQ 永远不攻击。**修复：递减前加双条件守卫 `if (tile.building.attackCd !== undefined && tile.building.attackCd > 0)`**；新建筑也可主动初始化 `attackCd: 0`。
 - **v2 resolveUnitAttack 金阶 mode 必须直接用 unit.mode：** 若先按距离算 `mode = dist > 1.2 ? 'ranged' : 'melee'` 再用 `if (gold) mode = unit.mode...` 覆盖，AOE 判断（`mode === 'ranged'`）会读错值。金阶分支**必须直接** `mode = unit.mode === 'melee' ? 'melee' : 'ranged'`，非金阶才走距离判断。
 - **v2 测试 IIFE 污染全局 gameState：** 每个测试的 `resetAll()` 调用各系统 `.init()` 清空全局状态（如 `BarracksSystem.init()` 清空 timers，把 `initGameState()` 注册的兵营全删掉，游戏循环永不吐兵）。**修复：所有测试 IIFE 执行完后 `gameState = initGameState()` 重新初始化**。
-- **v2 死亡单位 splice 后数组索引失效：** `CombatSystem._cleanup` 用 `splice` 移除 hp≤0 的单位，导致测试里 `u[2]` 可能指向错误对象或 undefined。**修复：测试中用 `.find(u => u.hexId === '...')` 按 hexId 查找存活单位，不用硬编码下标**。
+- **v2 HQ 摧毁必须绕过 RuinSystem + 触发 VictorySystem：** `CombatSystem._destroyBuilding` 对所有 hp≤0 的建筑调用 `RuinSystem.createRuin`，但 HQ 摧毁意味着游戏立即结束，不需要废墟生命周期（且废墟格会破坏波浪翻色逻辑）。**修复：在 `_destroyBuilding` 顶部加 `if (tile.building.type === 'hq') { tile.building = null; return }` 早返回；在 `_cleanup` 中识别 `isHq` 并调用 `VictorySystem.startWave(attacker, hexId, tiles)` 而非 `TerritorySystem.claim`**。
 
 ## Core Numbers
 
