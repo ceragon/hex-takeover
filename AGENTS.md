@@ -133,15 +133,14 @@ initGameState() → main loop → UI/render → click handling → tests
 ## Known Pitfalls
 
 <!-- Keep updated, max ~8-9 entries -->
-- **v2 格子状态机易混淆：** 格子有 3 种状态（未激活 / 可开 / 已开）× 4 种图标（? / 头盔 / 盾牌 / 金属）× 多种已开结果。状态转换必须单向，回退会引发 bug。
-- **v2 混合池 + 二次概率的 seed 管理：** 随机分两层（混合池选图标 → 档位选品质），必须用同一个 seeded RNG 实例贯穿两层，否则 replay 不可复现。
-- **v2 HexGrid flat-top 坐标 parity 易错：** `axialToPixel` 用 `sqrt(3)/2 * r` 隐式实现 RedBlob 的 odd-r 约定（奇数行右移半格），但 even/odd 行的 6 向邻居偏移集合不同。改邻居或寻路前**先用 `Math.hypot` 实测像素距离**（距离 ≈ size·√3 的才是真邻居，2·size 的不是），不要信记忆里的 offset 表。
-- **v2 pixelToAxial 不应 clamp：** `findHexAt` 要能检测"点击在画布空白处"，`pixelToAxial` 必须保留 cube rounding 的原始 (q, r)，**不要在内部 clamp 到 `[0, COLS)`/`[0, ROWS)`**——否则越界像素会被强制映到边缘格子，`findHexAt` 永远返回非 null。边界检查只在 `findHexAt` 里做一次。
-- **v2 HQ 不能放在地图边缘行：** HexGrid 9×13 中 r=0 和 r=12 是边缘行，HQ 在这些位置只有 4 个邻居（而非 6 个），导致 OpeningLayout 无法生成完整的 6 格开局。**HQ 应放在 r=1 和 r=11（或更内侧）**，确保 6 个邻居都在界内。
 - **v2 OpeningLayout 金矿概率数学：** P(≥1 金矿 in 6 slots) = 1 - (1-p)^6。要得到 70%，需 p ≈ 18%（即 0.82^6 ≈ 0.30），**不是**直觉上的 35%（0.65^6 ≈ 0.075，实际给 92.5%）。指数衰减很容易误算，改权重前先手算验证。
 - **v2 统计测试必须用 SeededRNG：** 简单 LCG mock `(s * 1103515245 + 12345) & 0x7fffffff` 低位比特周期短，weightedPick 分布严重偏移（如预期 70% 金矿实测 93%）。统计检验**必须用 SeededRNG（mulberry32）+ 不同 seed**，不要用临时 LCG mock。
 - **v2 `activateOpenableTiles` 必须对 tiles[hexId] 做 undefined 守卫：** 循环 `for (hexId of Object.keys(tiles))` 拿到的 key 对应的 tile 可能是 `undefined`（ClickHandler 等测试用"仅含少量键"的孤立 tiles dict 调用时），访问 `tile.state` 会抛 `Cannot read properties of undefined (reading 'state')`，且错误栈无模块定位。**修复：循环第一句加 `if (!tile) continue`**。
 - **v2 OpeningLayout 兵营必须带 tier：** `OpeningLayout.generateOpening` 生成 `barracks` 类型建筑时**必须同时分配 tier**（如 `building: { type: 'barracks', tier: 'green' }`）。BarracksSystem.tick 访问 `tile.building.tier` 得到 undefined → `UnitTypes.tierToCd[undefined]` = undefined → 乘 10 = NaN → 永远不吐兵。**修复：OpeningLayout 中 barracks 随机分配 tier（权重 50/30/15/5%）**。
+- **v2 HexGrid 实际是 pointy-top（非文档声称的 flat-top）：** `axialToPixel` 用 `(1.5 * r)` 公式，这是 **pointy-top** 而非 flat-top。`getNeighbors` 偏移表必须匹配 pointy-top odd-r 约定（even: `[0,-1],[-1,-1],[1,1],[0,1]`，odd: `[1,-1],[0,-1],[0,1],[-1,1]`），否则邻居关系不对称（A→B 成立但 B→A 不成立）。改偏移前**先用 `Math.hypot` 验证像素距离 = √3·size**。
+- **v2 湖水格必须可通行（视觉装饰而非移动屏障）：** 六边形邻居只覆盖 ±1 行，若 `getNeighbors` 和 BFS 过滤 r=LAKE_ROW，地图上下两半完全断开，单位无法跨越。**修复：`getNeighbors` 不再过滤湖水格，BFS 不再跳过湖水，渲染保留蓝色视觉带**。
+- **v2 computeBFS 返回的 path 包含目标格本身：** path[0] 是第一步，path[last] 是目标格。相邻目标返回 length=1（而非 0）。tick() 中 `path[0]` 是单位的下一步目标格。单位移动到敌方格子时触发 TerritorySystem.claim。
+- **v2 测试手动构造 unit 必须带 speed 字段：** MoveUnits.tick 读 `unit.speed` 计算 `moveProgress += speed/10`。遗漏 speed → `undefined/10 = NaN` → moveProgress 永远 NaN → 单位不动。**修复：测试 unit 字面量必须含 `speed: UnitTypes.get(key).speed`**。
 
 ## Core Numbers
 
