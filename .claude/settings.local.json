@@ -17,7 +17,9 @@
       "Bash(rm -f /tmp/hexcheck.mjs /tmp/hexcheck.cjs /tmp/hexplay.cjs /tmp/hexplay2.cjs /tmp/hex_*.png)",
       "Bash(python3 -m http.server 8765)",
       "Bash(kill %1)",
-      "Bash(curl *)"
+      "Bash(curl *)",
+      "Bash(python3 -m http.server 8080)",
+      "Bash(mktemp *)"
     ]
   }
 }
