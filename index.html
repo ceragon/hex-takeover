@@ -276,7 +276,8 @@ const TileSystem = {
   },
 
   activateOpenableTiles(tiles, rng) {
-    const activated = []
+    // 先收集候选格（基于调用前的状态快照），再统一激活，防止级联
+    const candidates = []
     for (const hexId of Object.keys(tiles)) {
       const tile = tiles[hexId]
       if (!tile) continue
@@ -285,17 +286,18 @@ const TileSystem = {
       const neighbors = HexGrid.getNeighbors(tile.q, tile.r)
       const adjToOwnActive = neighbors.some(n => {
         const nt = tiles[`${n.q},${n.r}`]
-        // 必须是己方领地（owner 相同且不为 null），且已激活（opened/openable）
         return nt && nt.owner && nt.owner === tile.owner
           && (nt.state === 'opened' || nt.state === 'openable')
       })
-      if (adjToOwnActive) {
-        const { icon, price } = this.assignTileRng(rng)
-        tile.state = 'openable'
-        tile.icon = icon
-        tile.price = price
-        activated.push(hexId)
-      }
+      if (adjToOwnActive) candidates.push(tile)
+    }
+    const activated = []
+    for (const tile of candidates) {
+      const { icon, price } = this.assignTileRng(rng)
+      tile.state = 'openable'
+      tile.icon = icon
+      tile.price = price
+      activated.push(`${tile.q},${tile.r}`)
     }
     return activated
   }
