@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node *)",
+      "Bash(grep -n \"tests passed\\\\|initGameState\\(\\)$\\\\|</script>\" index.html)",
+      "Bash(pkill -f \"http.server 8765\")",
+      "Bash(git commit -m ' *)",
+      "Bash(git check-ignore *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(git rm *)",
+      "Bash(git add *)"
+    ]
+  }
+}
