@@ -285,7 +285,8 @@ const TileSystem = {
       const neighbors = HexGrid.getNeighbors(tile.q, tile.r)
       const adjToOwnActive = neighbors.some(n => {
         const nt = tiles[`${n.q},${n.r}`]
-        return nt && nt.owner === tile.owner
+        // 必须是己方领地（owner 相同且不为 null），且已激活（opened/openable）
+        return nt && nt.owner && nt.owner === tile.owner
           && (nt.state === 'opened' || nt.state === 'openable')
       })
       if (adjToOwnActive) {
@@ -1606,8 +1607,7 @@ function initGameState() {
     if (tiles[hexId].owner) TerritorySystem.owners[hexId] = tiles[hexId].owner
   }
 
-  // 激活与己方 opened/openable 相邻的 inactive 格子
-  TileSystem.activateOpenableTiles(tiles, SeededRNG)
+  // OpeningLayout 已把 HQ 周围 6 格设为 openable，无需再激活
 
   return { tiles }
 }
@@ -1858,7 +1858,9 @@ function renderGrid() {
         stroke = ownerKey === 'player' ? TILE_STROKES.playerOpened
               : (ownerKey === 'ai' ? TILE_STROKES.aiOpened : TILE_STROKES.neutral)
       } else if (tile.state === 'openable') {
-        if (ownerKey === 'ai') {
+        // openable 格子按位置决定视觉归属（r<6=AI 红，r>=6=玩家绿）
+        const visualOwner = tile.r < 6 ? 'ai' : 'player'
+        if (visualOwner === 'ai') {
           // 敌方可开格：统一恶魔脸，不暴露图标/价格
           color = TILE_COLORS.aiOpenable
           stroke = TILE_STROKES.aiOpenable
