@@ -13,6 +13,7 @@ Deadline: 2026-06-22. Branch from `doc/PRD.md` and `CONTEXT.md`.
 ## Key Decisions
 
 - **Delivery:** Single `index.html`, all resources inlined, open in browser to play
+- **Target form factor:** 竖屏移动端，固定逻辑分辨率 540×960 + letterbox 等比缩放；全 HUD 画进 canvas；单击输入。详见 `docs/adr/0002-portrait-mobile-ui.md`
 - **Matchup:** Single-player vs AI (PvE)
 - **Rendering:** Canvas 2D, 10Hz fixed timestep via `requestAnimationFrame` + accumulator
 - **State:** Single `GameState` object, immutable updates
@@ -89,6 +90,8 @@ Tests are embedded at the bottom (lines ~960-1365): `testHexGrid`, `testTileReve
 | AI 决策周期 | 1.5s |
 | AI 升级评估周期 | 5s |
 | 单位攻击频率 | 1 次/秒 |
+| 人口上限 | 每方 30（开发期可调，参考图为 100；只数移动单位，建筑不计入） |
+| 满人口行为 | 所有产兵源 CD 暂停，名额释放后恢复；双方独立，AI 同样受限 |
 
 ## Module Insertion Order — CRITICAL
 
@@ -133,6 +136,9 @@ initGameState() → main loop → UI/render → click handling → tests
 ## Known Pitfalls
 
 <!-- Keep updated, max ~8-9 entries -->
+- **HUD 必须在 renderGrid 之后画：** `renderGrid` 用 `ctx.fillRect(0,0,canvas.width,canvas.height)` 清整块画布。`renderTopBar`/`renderBottomBar`/`renderNotification`/覆盖层若在 renderGrid 之前画会被清掉。**render() 顺序固定为：grid → units → wave → death → topBar → bottomBar → notification → 覆盖层**。
+- **TerritorySystem.owners 开局必须登记已归属格：** `initGameState` 设 `tile.owner` 但不自动写 `TerritorySystem.owners`，导致 `count(owner)` 开局返回 0（地块数 HUD 显示 0/0）。**修复：generateOpening 后遍历 tiles，把有 owner 的格子写进 `TerritorySystem.owners`**。注意 `TerritorySystem.init()` 仍清空 owners（测试依赖），登记发生在 initGameState 而非 init。
+- **canvas 点击坐标必须做 letterbox 缩放补偿：** 画布逻辑尺寸 540×960 但 CSS 缩放后显示尺寸不同。点击事件给的是 CSS 像素，必须 `(clientX-rect.left) * canvas.width/rect.width` 换算到逻辑坐标，否则命中全偏。见 `toCanvasCoords`。
 - **v2 TerritorySystem.claim 现在同时设置 tile.owner + flashTicks：** slice 9 起 `claim(hexId, owner, tiles, rng)` 在 `tiles` 存在时会设 `tile.owner = owner` 和 `tile.flashTicks = 3`（领地变更闪白过渡）。旧代码假设 claim 不改 tile.owner 已失效。**修复：若测试只传空对象 `{}` 作为 tiles，`tiles[hexId]` 是 undefined，安全跳过；但生产代码总会传完整 tiles 字典**。
 - **v2 resolveUnitAttack 金阶 mode 必须直接用 unit.mode：** 若先按距离算 `mode = dist > 1.2 ? 'ranged' : 'melee'` 再用 `if (gold) mode = unit.mode...` 覆盖，AOE 判断（`mode === 'ranged'`）会读错值。金阶分支**必须直接** `mode = unit.mode === 'melee' ? 'melee' : 'ranged'`，非金阶才走距离判断。
 - **v2 测试 IIFE 污染全局 gameState：** 每个测试的 `resetAll()` 调用各系统 `.init()` 清空全局状态（如 `BarracksSystem.init()` 清空 timers，把 `initGameState()` 注册的兵营全删掉，游戏循环永不吐兵）。**修复：所有测试 IIFE 执行完后 `gameState = initGameState()` 重新初始化**。
@@ -149,4 +155,6 @@ Refer to `doc/PRD.md` → "核心数值" section for all balance values. Quick r
 
 ## Out of Scope
 
-Card collection/upgrades, multi-faction, unit merge/star, real-time PvP, audio/BGM, mobile adaptation. See `doc/PRD.md` → "Out of Scope".
+Card collection/upgrades, multi-faction, unit merge/star, real-time PvP, audio/BGM. See `doc/PRD.md` → "Out of Scope".
+
+> ⚠️ **"mobile adaptation" 已移出 Out of Scope（2026-05-29）**：竖屏移动端现为主交付形态，见 Key Decisions 与 `docs/adr/0002-portrait-mobile-ui.md`。

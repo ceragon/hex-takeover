@@ -2,47 +2,40 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>占城大师</title>
 <link rel="icon" href="data:,">
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    background: #1a1a2e;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
+  html, body {
+    background: #000;
     font-family: monospace;
     color: #eee;
-    min-height: 100vh;
-    position: relative;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+  }
+  /* letterbox 容器：填满视口，等比缩放居中 540×960 画布 */
+  #canvas-wrapper {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100vw;
+    height: 100vh;
+    background: #000;
   }
   #game-canvas {
-    border: 2px solid #0f3460;
-    margin-top: 16px;
-    cursor: pointer;
     background: #0a0a1a;
+    touch-action: none;
+    cursor: pointer;
+    display: block;
   }
 </style>
 </head>
 <body>
 
-<canvas id="game-canvas" width="560" height="540"></canvas>
-<div id="ui-bar" style="margin-top:8px;font-size:14px;display:flex;gap:32px;">
-  <span id="countdown" style="color:#f44;font-weight:bold;">3:00</span>
-  <span id="player-gold" style="color:#6af;">己方金币: 60</span>
-  <span id="ai-gold" style="color:#f66;">敌方金币: 60</span>
-  <span id="territory-count" style="color:#aaa;">占领: 0/108</span>
-  <span id="difficulty-label" style="color:#9c9;">难度: 普通</span>
-</div>
-<div id="difficulty-overlay" style="position:fixed;inset:0;background:rgba(0,0,0,0.85);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:10;font-family:monospace;color:#eee;">
-  <h1 style="margin-bottom:24px;color:#6af;">占城大师 v2</h1>
-  <p style="margin-bottom:32px;color:#aaa;">选择 AI 难度</p>
-  <div style="display:flex;gap:24px;">
-    <button id="btn-normal" style="padding:16px 32px;font-size:18px;font-family:monospace;background:#0f3460;color:#eee;border:2px solid #6af;cursor:pointer;">普通</button>
-    <button id="btn-hard" style="padding:16px 32px;font-size:18px;font-family:monospace;background:#601030;color:#eee;border:2px solid #f66;cursor:pointer;">困难</button>
-  </div>
-  <p style="margin-top:32px;color:#777;font-size:12px;max-width:400px;text-align:center;">普通：AI 从 top-3 动作随机选，适合上手。困难：AI 永远选最优动作，需发挥良好才能赢。</p>
+<div id="canvas-wrapper">
+  <canvas id="game-canvas" width="540" height="960"></canvas>
 </div>
 
 <script>
@@ -85,7 +78,7 @@ const HexGrid = {
   COLS: 9,
   ROWS: 13,
   LAKE_ROW: 6,
-  hexSize: 24,
+  hexSize: 20,
 
   isInBounds(q, r) {
     return Number.isInteger(q) && Number.isInteger(r)
@@ -524,6 +517,11 @@ const BarracksSystem = {
 
       const tier = tile.building.tier
       const cdTicks = UnitTypes.tierToCd[tier] * 10
+
+      // 人口上限：满员时暂停该兵营 CD（不增 timer），名额释放后从原进度恢复
+      let pop = 0
+      for (const u of this.units) if (u.owner === tile.owner) pop++
+      if (pop >= POP_CAP) continue
 
       this.timers[hexId] = (this.timers[hexId] || 0) + 1
       if (this.timers[hexId] >= cdTicks) {
@@ -1255,25 +1253,13 @@ const MoveUnits = {
 }
 
 // ============================================================
-// showNotification: 屏幕上方短暂提示（slice 9 打磨视觉）
+// showNotification: 屏幕上方短暂提示（canvas 绘制，15 tick≈1.5s）
 // ============================================================
-let _notificationEl = null
-let _notificationTimer = null
+let _notificationMsg = ''
+let _notificationTicks = 0
 function showNotification(msg) {
-  if (typeof document === 'undefined') return
-  if (!_notificationEl) {
-    _notificationEl = document.createElement('div')
-    _notificationEl.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);' +
-      'background:#222;border:1px solid #f66;color:#fff;padding:6px 14px;font-family:monospace;' +
-      'font-size:14px;border-radius:4px;pointer-events:none;opacity:0;transition:opacity 0.2s;z-index:10'
-    document.body.appendChild(_notificationEl)
-  }
-  _notificationEl.textContent = msg
-  _notificationEl.style.opacity = '1'
-  clearTimeout(_notificationTimer)
-  _notificationTimer = setTimeout(() => {
-    if (_notificationEl) _notificationEl.style.opacity = '0'
-  }, 1500)
+  _notificationMsg = msg
+  _notificationTicks = 15
 }
 
 // ============================================================
@@ -1598,6 +1584,12 @@ function initGameState() {
     }
   }
 
+  // 开局已归属格子（HQ + 周围建筑）登记进 TerritorySystem，使地块数从开局即正确
+  for (const hexId of Object.keys(tiles)) {
+    const tile = tiles[hexId]
+    if (tile && tile.owner) TerritorySystem.owners[hexId] = tile.owner
+  }
+
   TileSystem.activateOpenableTiles(tiles, SeededRNG)
 
   return { tiles }
@@ -1612,7 +1604,22 @@ let tickCount = 0
 const canvas = document.getElementById('game-canvas')
 const ctx = canvas.getContext('2d')
 
-const RENDER_OFFSET = { x: 75, y: 35 }
+// letterbox：把 540×960 逻辑画布等比放大填满视口，保持 9:16，多余留黑边
+function resizeCanvas() {
+  const vw = window.innerWidth
+  const vh = window.innerHeight
+  const scale = Math.min(vw / canvas.width, vh / canvas.height)
+  canvas.style.width = (canvas.width * scale) + 'px'
+  canvas.style.height = (canvas.height * scale) + 'px'
+}
+window.addEventListener('resize', resizeCanvas)
+resizeCanvas()
+
+// 顶部/底部 HUD 栏高度（canvas 内绘制，地图区夹在中间）
+const TOP_BAR_HEIGHT = 110
+const BOTTOM_BAR_HEIGHT = 90
+// 网格在地图区内居中（hexSize=20，9×12+湖水，竖屏 540×960）
+const RENDER_OFFSET = { x: 27.5, y: 301 }
 
 const TIER_COLORS = {
   green:  '#4a8',
@@ -1820,28 +1827,6 @@ function renderUnits() {
   }
 }
 
-function updateUI() {
-  const pg = document.getElementById('player-gold')
-  const ag = document.getElementById('ai-gold')
-  const tc = document.getElementById('territory-count')
-  const cd = document.getElementById('countdown')
-  if (pg) pg.textContent = `己方金币: ${ResourceSystem.gold.player}`
-  if (ag) ag.textContent = `敌方金币: ${ResourceSystem.gold.ai}`
-  if (tc) tc.textContent = `占领: ${TerritorySystem.count('player')}/${TerritorySystem.total}`
-  if (cd) {
-    const sec = Math.ceil(VictorySystem.countdown)
-    const m = Math.floor(sec / 60)
-    const s = sec % 60
-    cd.textContent = `${m}:${String(s).padStart(2, '0')}`
-    if (sec < 30) {
-      const flash = Math.floor(tickCount / 5) % 2 === 0
-      cd.style.color = flash ? '#ff0' : '#f22'
-    } else {
-      cd.style.color = '#f44'
-    }
-  }
-}
-
 function renderWave() {
   const wave = VictorySystem.wave
   if (!wave) return
@@ -1872,59 +1857,283 @@ function renderDeathEffects() {
   }
 }
 
+// canvas 内 UI 覆盖层状态机 + 按钮命中区（替代 DOM 弹窗）
+const CanvasUI = {
+  state: 'difficulty', // 'difficulty' | 'upgrade' | 'game_over' | 'none'
+  hitRegions: [],      // [{ id, x, y, w, h }]
+
+  clearRegions() { this.hitRegions = [] },
+  addRegion(id, x, y, w, h) { this.hitRegions.push({ id, x, y, w, h }) },
+  hitTest(cx, cy) {
+    for (let i = this.hitRegions.length - 1; i >= 0; i--) {
+      const r = this.hitRegions[i]
+      if (cx >= r.x && cx <= r.x + r.w && cy >= r.y && cy <= r.y + r.h) return r.id
+    }
+    return null
+  }
+}
+
+// 圆角按钮（带命中区注册），返回是否可点
+function drawButton(id, x, y, w, h, label, enabled = true, accent = '#48f') {
+  ctx.save()
+  ctx.beginPath()
+  const rr = 8
+  ctx.moveTo(x + rr, y)
+  ctx.arcTo(x + w, y, x + w, y + h, rr)
+  ctx.arcTo(x + w, y + h, x, y + h, rr)
+  ctx.arcTo(x, y + h, x, y, rr)
+  ctx.arcTo(x, y, x + w, y, rr)
+  ctx.closePath()
+  ctx.fillStyle = enabled ? accent : '#555'
+  ctx.fill()
+  ctx.font = 'bold 18px monospace'
+  ctx.fillStyle = '#fff'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(label, x + w / 2, y + h / 2)
+  ctx.restore()
+  CanvasUI.addRegion(id, x, y, w, h)
+}
+
+// 难度选择屏（canvas 绘制）
+function renderDifficultyScreen() {
+  ctx.save()
+  ctx.fillStyle = 'rgba(0,0,0,0.88)'
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillStyle = '#6af'
+  ctx.font = 'bold 34px monospace'
+  ctx.fillText('占城大师 v2', canvas.width / 2, 260)
+  ctx.fillStyle = '#aaa'
+  ctx.font = '18px monospace'
+  ctx.fillText('选择 AI 难度', canvas.width / 2, 320)
+
+  CanvasUI.clearRegions()
+  const bw = 200, bh = 56
+  drawButton('diff-normal', (canvas.width - bw) / 2, 400, bw, bh, '普通', true, '#0f3460')
+  drawButton('diff-hard', (canvas.width - bw) / 2, 480, bw, bh, '困难', true, '#601030')
+
+  ctx.fillStyle = '#777'
+  ctx.font = '12px monospace'
+  ctx.fillText('普通：AI 从 top-3 动作随机选，适合上手。', canvas.width / 2, 580)
+  ctx.fillText('困难：AI 永远选最优动作，需发挥良好才能赢。', canvas.width / 2, 600)
+  ctx.restore()
+}
+
+// 某一方当前存活的移动单位数（建筑不计入）——人口
+function getPopulationCount(owner) {
+  let n = 0
+  for (const u of BarracksSystem.units) if (u.owner === owner) n++
+  return n
+}
+
+const POP_CAP = 30
+
+// 顶部 HUD 栏：左=玩家头像+地块数+人口；中=倒计时；右=电脑头像+地块数
+function renderTopBar() {
+  ctx.save()
+  ctx.fillStyle = 'rgba(12,14,24,0.92)'
+  ctx.fillRect(0, 0, canvas.width, TOP_BAR_HEIGHT)
+  ctx.strokeStyle = '#0f3460'
+  ctx.lineWidth = 2
+  ctx.beginPath()
+  ctx.moveTo(0, TOP_BAR_HEIGHT)
+  ctx.lineTo(canvas.width, TOP_BAR_HEIGHT)
+  ctx.stroke()
+
+  // 头像（程序化绘制圆形 + emoji，零依赖）
+  drawAvatar(34, 40, '#6af', '🦸')
+  drawAvatar(canvas.width - 34, 40, '#f66', '🤖')
+
+  // 左侧：玩家信息
+  const playerTiles = TerritorySystem.count('player')
+  const pop = getPopulationCount('player')
+  ctx.textAlign = 'left'
+  ctx.textBaseline = 'middle'
+  ctx.font = 'bold 15px monospace'
+  ctx.fillStyle = '#eee'
+  ctx.fillText('玩家', 62, 28)
+  ctx.font = '14px monospace'
+  ctx.fillStyle = '#6c6'
+  ctx.fillText(`🟩 ${playerTiles}`, 62, 50)
+  ctx.fillStyle = '#cc8'
+  ctx.fillText(`👥 ${pop}/${POP_CAP}`, 62, 70)
+
+  // 右侧：电脑信息（不显示敌方金币）
+  const aiTiles = TerritorySystem.count('ai')
+  ctx.textAlign = 'right'
+  ctx.font = 'bold 15px monospace'
+  ctx.fillStyle = '#eee'
+  ctx.fillText('电脑', canvas.width - 62, 28)
+  ctx.font = '14px monospace'
+  ctx.fillStyle = '#e88'
+  ctx.fillText(`${aiTiles} 🟥`, canvas.width - 62, 50)
+
+  // 中央：倒计时
+  const sec = Math.ceil(VictorySystem.countdown)
+  const mm = Math.floor(sec / 60)
+  const ss = sec % 60
+  const timeStr = `${mm}:${String(ss).padStart(2, '0')}`
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.font = 'bold 30px monospace'
+  if (sec < 30) {
+    const flash = Math.floor(tickCount / 5) % 2 === 0
+    ctx.fillStyle = flash ? '#ff0' : '#f22'
+  } else {
+    ctx.fillStyle = '#f44'
+  }
+  ctx.fillText(timeStr, canvas.width / 2, 40)
+  ctx.font = '11px monospace'
+  ctx.fillStyle = '#888'
+  ctx.fillText('时间剩余', canvas.width / 2, 70)
+  ctx.restore()
+}
+
+// 底部 HUD 栏：左下金币徽章 + 我方金币（不显示敌方金币）
+function renderBottomBar() {
+  const y0 = canvas.height - BOTTOM_BAR_HEIGHT
+  ctx.save()
+  ctx.fillStyle = 'rgba(12,14,24,0.92)'
+  ctx.fillRect(0, y0, canvas.width, BOTTOM_BAR_HEIGHT)
+  ctx.strokeStyle = '#0f3460'
+  ctx.lineWidth = 2
+  ctx.beginPath()
+  ctx.moveTo(0, y0)
+  ctx.lineTo(canvas.width, y0)
+  ctx.stroke()
+
+  const badgeY = y0 + BOTTOM_BAR_HEIGHT / 2
+  ctx.beginPath()
+  ctx.arc(40, badgeY, 20, 0, Math.PI * 2)
+  ctx.fillStyle = '#3a2f10'
+  ctx.fill()
+  ctx.lineWidth = 3
+  ctx.strokeStyle = '#fc4'
+  ctx.stroke()
+  ctx.font = '22px serif'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText('🪙', 40, badgeY + 1)
+
+  ctx.textAlign = 'left'
+  ctx.font = 'bold 26px monospace'
+  ctx.fillStyle = '#fc4'
+  ctx.fillText(`${ResourceSystem.gold.player}`, 70, badgeY)
+  ctx.restore()
+}
+
+// 通知 toast（canvas 绘制）：顶栏下方居中，淡出
+function renderNotification() {
+  if (_notificationTicks <= 0) return
+  const alpha = Math.min(1, _notificationTicks / 8)
+  const y = TOP_BAR_HEIGHT + 28
+  ctx.save()
+  ctx.font = '15px monospace'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  const tw = ctx.measureText(_notificationMsg).width
+  const bw = tw + 28
+  const bx = (canvas.width - bw) / 2
+  ctx.globalAlpha = alpha
+  ctx.fillStyle = '#222'
+  ctx.fillRect(bx, y - 16, bw, 32)
+  ctx.strokeStyle = '#f66'
+  ctx.lineWidth = 1
+  ctx.strokeRect(bx, y - 16, bw, 32)
+  ctx.fillStyle = '#fff'
+  ctx.fillText(_notificationMsg, canvas.width / 2, y)
+  ctx.restore()
+  _notificationTicks--
+}
+
+// 程序化头像：彩色圆底 + emoji
+function drawAvatar(cx, cy, ringColor, emoji) {
+  ctx.save()
+  ctx.beginPath()
+  ctx.arc(cx, cy, 22, 0, Math.PI * 2)
+  ctx.fillStyle = '#222'
+  ctx.fill()
+  ctx.lineWidth = 3
+  ctx.strokeStyle = ringColor
+  ctx.stroke()
+  ctx.font = '24px serif'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(emoji, cx, cy + 1)
+  ctx.restore()
+}
+
 function render() {
   renderGrid()
   renderUnits()
   renderWave()
   renderDeathEffects()
-  updateUI()
-  renderGameOverOverlay()
+  renderTopBar()
+  renderBottomBar()
+  renderNotification()
+  if (CanvasUI.state === 'difficulty') {
+    renderDifficultyScreen()
+  } else {
+    renderGameOverOverlay()
+    if (CanvasUI.state === 'upgrade') renderUpgradePanel()
+  }
 }
 
+// 游戏结束覆盖层（canvas 绘制）。波浪动画播放期间不显示，由 render() 在 wave 结束后调用
 function renderGameOverOverlay() {
-  let overlay = document.getElementById('game-over-overlay')
   if (!VictorySystem.isGameOver() || VictorySystem.wave !== null) {
-    if (overlay) overlay.style.display = 'none'
+    if (CanvasUI.state === 'game_over') { CanvasUI.state = 'none'; CanvasUI.clearRegions() }
     return
   }
-  if (!overlay) {
-    overlay = document.createElement('div')
-    overlay.id = 'game-over-overlay'
-    overlay.style.cssText = `position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.75);display:flex;flex-direction:column;align-items:center;justify-content:center;z-index:100;`
-    overlay.innerHTML = `
-      <h1 id="game-over-title" style="font-size:48px;margin-bottom:16px;"></h1>
-      <p id="game-over-reason" style="font-size:18px;color:#aaa;margin-bottom:32px;"></p>
-      <button id="restart-btn" style="padding:12px 32px;font-size:18px;background:#48f;color:#fff;border:none;border-radius:6px;cursor:pointer;font-family:monospace;">重新开始</button>
-    `
-    document.body.appendChild(overlay)
-    document.getElementById('restart-btn').addEventListener('click', (e) => {
-      e.stopPropagation()
-      restartGame()
-    })
-  }
+  CanvasUI.state = 'game_over'
   const go = VictorySystem.gameOver
-  const title = document.getElementById('game-over-title')
-  const reason = document.getElementById('game-over-reason')
-  if (title) {
-    title.textContent = go.winner === 'player' ? '胜利' : '失败'
-    title.style.color = go.winner === 'player' ? '#6f6' : '#f66'
+  ctx.save()
+  ctx.fillStyle = 'rgba(0,0,0,0.78)'
+  ctx.fillRect(0, 0, canvas.width, canvas.height)
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.font = 'bold 48px monospace'
+  ctx.fillStyle = go.winner === 'player' ? '#6f6' : '#f66'
+  ctx.fillText(go.winner === 'player' ? '胜利' : '失败', canvas.width / 2, 380)
+
+  let reasonText
+  if (go.reason === 'hq_destroyed') {
+    reasonText = go.winner === 'player' ? '敌方 HQ 已被摧毁' : '己方 HQ 已被摧毁'
+  } else {
+    const p = TerritorySystem.count('player')
+    const a = TerritorySystem.count('ai')
+    reasonText = `时间耗尽 · 玩家 ${p} 格 vs AI ${a} 格`
   }
-  if (reason) {
-    if (go.reason === 'hq_destroyed') {
-      reason.textContent = go.winner === 'player' ? '敌方 HQ 已被摧毁' : '己方 HQ 已被摧毁'
-    } else {
-      const p = TerritorySystem.count('player')
-      const a = TerritorySystem.count('ai')
-      reason.textContent = `时间耗尽 · 玩家 ${p} 格 vs AI ${a} 格`
-    }
-  }
-  overlay.style.display = 'flex'
+  ctx.font = '17px monospace'
+  ctx.fillStyle = '#aaa'
+  ctx.fillText(reasonText, canvas.width / 2, 440)
+
+  CanvasUI.clearRegions()
+  const bw = 180, bh = 52
+  drawButton('restart', (canvas.width - bw) / 2, 500, bw, bh, '重新开始', true, '#48f')
+  ctx.restore()
 }
 
+// 当前升级面板对应的格子（null 表示未打开）
+let _upgradeTile = null
+
 function showUpgradePanel(tile) {
-  hideUpgradePanel()
-  const panel = document.createElement('div')
-  panel.id = 'upgrade-panel'
+  _upgradeTile = tile
+  CanvasUI.state = 'upgrade'
+}
+
+function hideUpgradePanel() {
+  if (_upgradeTile === null) return
+  _upgradeTile = null
+  if (CanvasUI.state === 'upgrade') { CanvasUI.state = 'none'; CanvasUI.clearRegions() }
+}
+
+// 升级面板（canvas 绘制）
+function renderUpgradePanel() {
+  const tile = _upgradeTile
+  if (!tile || !tile.building) return
   const cost = UpgradeSystem.getCost(tile)
   const level = tile.building.level || 0
   const gold = ResourceSystem.gold.player
@@ -1943,39 +2152,32 @@ function showUpgradePanel(tile) {
     const nextRange = (curRange + 0.5).toFixed(1)
     preview = `ATK ${curAtk} → ${nextAtk} · 射程 ${curRange.toFixed(1)} → ${nextRange}`
   }
-  panel.innerHTML = `
-    <div style="background:#222;padding:12px 16px;border:2px solid #48f;border-radius:6px;min-width:220px;">
-      <div style="font-size:16px;margin-bottom:8px;">${name} · Lv.${level}</div>
-      <div style="font-size:12px;color:#aaa;margin-bottom:8px;">${preview}</div>
-      <button id="upgrade-btn" style="width:100%;padding:8px;font-size:14px;background:${gold >= cost ? '#48f' : '#555'};color:#fff;border:none;border-radius:4px;cursor:${gold >= cost ? 'pointer' : 'not-allowed'};font-family:monospace;">升级 (${cost} 金)</button>
-      <button id="upgrade-close" style="width:100%;padding:4px;font-size:12px;background:transparent;color:#888;border:1px solid #444;border-radius:4px;cursor:pointer;margin-top:6px;font-family:monospace;">关闭</button>
-    </div>
-  `
-  panel.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:50;'
-  document.body.appendChild(panel)
-  const btn = document.getElementById('upgrade-btn')
-  if (gold >= cost) {
-    btn.addEventListener('click', (e) => {
-      e.stopPropagation()
-      const result = UpgradeSystem.upgrade(tile, 'player')
-      if (result.ok) {
-        showNotification(`升级成功 → Lv.${result.newLevel}`)
-      } else if (result.reason === 'insufficient_gold') {
-        showNotification('金币不足')
-      }
-      hideUpgradePanel()
-      render()
-    })
-  }
-  document.getElementById('upgrade-close').addEventListener('click', (e) => {
-    e.stopPropagation()
-    hideUpgradePanel()
-  })
-}
 
-function hideUpgradePanel() {
-  const p = document.getElementById('upgrade-panel')
-  if (p) p.remove()
+  const pw = 320, ph = 200
+  const px = (canvas.width - pw) / 2
+  const py = (canvas.height - ph) / 2
+  ctx.save()
+  ctx.fillStyle = 'rgba(20,22,34,0.97)'
+  ctx.fillRect(px, py, pw, ph)
+  ctx.strokeStyle = '#48f'
+  ctx.lineWidth = 2
+  ctx.strokeRect(px, py, pw, ph)
+
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.font = 'bold 20px monospace'
+  ctx.fillStyle = '#eee'
+  ctx.fillText(`${name} · Lv.${level}`, canvas.width / 2, py + 36)
+  ctx.font = '14px monospace'
+  ctx.fillStyle = '#aaa'
+  ctx.fillText(preview, canvas.width / 2, py + 70)
+
+  CanvasUI.clearRegions()
+  const bw = pw - 48
+  const affordable = gold >= cost
+  drawButton('upgrade-do', px + 24, py + 96, bw, 44, `升级 (${cost} 金)`, affordable, '#48f')
+  drawButton('upgrade-close', px + 24, py + 150, bw, 34, '关闭', true, '#333')
+  ctx.restore()
 }
 
 function restartGame() {
@@ -1983,20 +2185,61 @@ function restartGame() {
   DeathEffect.reset()
   gameState = initGameState()
   tickCount = 0
-  hideUpgradePanel()
-  const overlay = document.getElementById('game-over-overlay')
-  if (overlay) overlay.remove()
+  _upgradeTile = null
+  CanvasUI.state = 'none'
+  CanvasUI.clearRegions()
   render()
 }
 
 // ============================================================
 // Click handling
 // ============================================================
-canvas.addEventListener('click', (event) => {
-  if (VictorySystem.isGameOver()) return
+// 把屏幕坐标（CSS 像素）换算为画布逻辑坐标（letterbox 缩放补偿）
+function toCanvasCoords(event) {
   const rect = canvas.getBoundingClientRect()
-  const mx = event.clientX - rect.left - RENDER_OFFSET.x
-  const my = event.clientY - rect.top - RENDER_OFFSET.y
+  const scaleX = canvas.width / rect.width
+  const scaleY = canvas.height / rect.height
+  return {
+    cx: (event.clientX - rect.left) * scaleX,
+    cy: (event.clientY - rect.top) * scaleY
+  }
+}
+
+// 分发 canvas UI 按钮点击，返回 true 表示已消费
+function handleCanvasUIClick(id) {
+  if (!id) return false
+  if (id === 'diff-normal') { startGameWithDifficulty('normal'); return true }
+  if (id === 'diff-hard') { startGameWithDifficulty('hard'); return true }
+  if (id === 'restart') { restartGame(); return true }
+  if (id === 'upgrade-close') { hideUpgradePanel(); render(); return true }
+  if (id === 'upgrade-do') {
+    const tile = _upgradeTile
+    if (tile) {
+      const result = UpgradeSystem.upgrade(tile, 'player')
+      if (result.ok) showNotification(`升级成功 → Lv.${result.newLevel}`)
+      else if (result.reason === 'insufficient_gold') showNotification('金币不足')
+    }
+    hideUpgradePanel()
+    render()
+    return true
+  }
+  return false
+}
+
+canvas.addEventListener('click', (event) => {
+  const { cx, cy } = toCanvasCoords(event)
+
+  // 覆盖层优先：先查 canvas UI 按钮命中
+  if (CanvasUI.state !== 'none') {
+    const id = CanvasUI.hitTest(cx, cy)
+    if (handleCanvasUIClick(id)) return
+    // 难度/结束屏吃掉所有点击；升级面板点击空白处关闭
+    if (CanvasUI.state === 'difficulty' || CanvasUI.state === 'game_over') return
+  }
+
+  if (VictorySystem.isGameOver()) return
+  const mx = cx - RENDER_OFFSET.x
+  const my = cy - RENDER_OFFSET.y
 
   const hex = HexGrid.findHexAt(mx, my)
   if (!hex) {
@@ -2045,21 +2288,15 @@ const gameLoop = createGameLoop(() => {
   render()
 })
 
-render()
-
 function startGameWithDifficulty(mode) {
   AIBehavior.setDifficulty(mode)
-  document.getElementById('difficulty-label').textContent =
-    mode === 'hard' ? '难度: 困难' : '难度: 普通'
-  const overlay = document.getElementById('difficulty-overlay')
-  if (overlay) overlay.style.display = 'none'
+  CanvasUI.state = 'none'
+  CanvasUI.clearRegions()
   gameLoop.start()
 }
 
-const btnNormal = document.getElementById('btn-normal')
-const btnHard = document.getElementById('btn-hard')
-if (btnNormal) btnNormal.addEventListener('click', () => startGameWithDifficulty('normal'))
-if (btnHard) btnHard.addEventListener('click', () => startGameWithDifficulty('hard'))
+// 启动：先渲染难度选择屏（CanvasUI.state 初始为 'difficulty'），等玩家点击后开局
+render()
 
 // ============================================================
 // Embedded assertions: HexGrid (v2 — 9×12 + 湖水)
@@ -4050,6 +4287,58 @@ if (btnHard) btnHard.addEventListener('click', () => startGameWithDifficulty('ha
   }
 
   console.log('[test] WaveEffect tests passed (6 cases)')
+})()
+
+;(function testPopulationCap() {
+  // 满人口时兵营暂停吐兵（CD 不推进），名额释放后恢复
+  BarracksSystem.init()
+  const tiles = {
+    '3,11': { q: 3, r: 11, owner: 'player', state: 'opened', building: { type: 'barracks', tier: 'green' } }
+  }
+  BarracksSystem.registerBarracks('3,11')
+  const rng = { next() { return 0.3 }, weightedPick(o) { return o[0] } }
+
+  // 绿阶 CD=30 tick。先填满 player 人口到 POP_CAP
+  for (let i = 0; i < POP_CAP; i++) {
+    BarracksSystem.units.push({ owner: 'player', tier: 'green', hexId: '3,11', hp: 1 })
+  }
+  console.assert(getPopulationCount('player') === POP_CAP,
+    `预置后人口应为 ${POP_CAP}，实际 ${getPopulationCount('player')}`)
+
+  // 满员：tick 多轮，timer 不应推进、不应吐兵
+  const timerBefore = BarracksSystem.timers['3,11'] || 0
+  for (let i = 0; i < 50; i++) {
+    const spawned = BarracksSystem.tick(tiles, rng)
+    console.assert(spawned.length === 0, `满人口时第 ${i+1} tick 不应吐兵`)
+  }
+  console.assert((BarracksSystem.timers['3,11'] || 0) === timerBefore,
+    `满人口时 CD timer 应暂停在 ${timerBefore}，实际 ${BarracksSystem.timers['3,11']}`)
+
+  // 释放一个名额（模拟单位死亡）→ 兵营恢复，再走满 CD 后吐兵
+  BarracksSystem.units.pop()
+  console.assert(getPopulationCount('player') === POP_CAP - 1, '释放后人口应 -1')
+  let resumed = []
+  for (let i = 0; i < 30; i++) {
+    resumed = resumed.concat(BarracksSystem.tick(tiles, rng))
+  }
+  console.assert(resumed.length === 1,
+    `释放名额后应恢复吐兵 1 个，实际 ${resumed.length}`)
+
+  // AI 与玩家独立计数：player 满员不影响 ai 兵营
+  BarracksSystem.init()
+  const aiTiles = {
+    '4,1': { q: 4, r: 1, owner: 'ai', state: 'opened', building: { type: 'barracks', tier: 'green' } }
+  }
+  BarracksSystem.registerBarracks('4,1')
+  for (let i = 0; i < POP_CAP; i++) {
+    BarracksSystem.units.push({ owner: 'player', tier: 'green', hexId: 'x', hp: 1 })
+  }
+  let aiSpawn = []
+  for (let i = 0; i < 30; i++) aiSpawn = aiSpawn.concat(BarracksSystem.tick(aiTiles, rng))
+  console.assert(aiSpawn.length === 1,
+    `player 满员不应影响 ai 兵营，ai 应吐兵 1 个，实际 ${aiSpawn.length}`)
+
+  console.log('[test] PopulationCap tests passed')
 })()
 
 // 测试会重置全局系统，重新初始化游戏状态
