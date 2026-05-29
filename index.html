@@ -299,50 +299,37 @@ const TileSystem = {
 }
 
 // ============================================================
-// OpeningLayout: 开局 HQ 周围 6 格随机填入建筑
-// 建筑池：兵营 54% / 箭塔 28% / 金矿 18%
-// P(≥1 金矿) = 1 - 0.82^6 ≈ 70%
+// OpeningLayout: 开局 HQ 周围 6 格设为中立 openable（图标+价格）
+// 保底：至少 1 格是 ⚙️（金矿）且价格 25
 // ============================================================
 const OpeningLayout = {
-  BUILDING_OPTIONS: ['barracks', 'archer_tower', 'gold_mine'],
-  BUILDING_WEIGHTS: [54, 28, 18],
-
   generateOpening(hq, tiles, rng) {
     const neighbors = HexGrid.getNeighbors(hq.q, hq.r)
-    const slots = neighbors.filter(n =>
-      HexGrid.isInBounds(n.q, n.r)
-    )
+    const slots = neighbors.filter(n => HexGrid.isInBounds(n.q, n.r))
 
-    const results = []
+    const generated = []
     for (const slot of slots) {
-      results.push(rng.weightedPick(this.BUILDING_OPTIONS, this.BUILDING_WEIGHTS))
+      generated.push(TileSystem.assignTileRng(rng))
+    }
+
+    // 保底：至少 1 格是 ⚙️+25 金（可以是同一格）
+    const hasGuarantee = generated.some(g => g.icon === 'metal' && g.price === 25)
+    if (!hasGuarantee && generated.length > 0) {
+      generated[0] = { icon: 'metal', price: 25 }
     }
 
     for (let i = 0; i < slots.length; i++) {
       const { q, r } = slots[i]
-      const hexId = `${q},${r}`
-      let building = { type: results[i] }
-      if (results[i] === 'barracks') {
-        const tier = rng.weightedPick(['green', 'blue', 'purple', 'gold'], [50, 30, 15, 5])
-        building = { type: 'barracks', tier }
-      } else if (results[i] === 'archer_tower') {
-        const priceTier = rng.weightedPick([50, 100], [50, 50])
-        building = { type: 'archer_tower', priceTier }
-      }
-      const spec = BuildingTypes.getSpec(building.type, building.priceTier)
-      if (spec) {
-        building.hp = spec.hp
-        building.maxHp = spec.hp
-      }
-      tiles[hexId] = {
+      tiles[`${q},${r}`] = {
         q, r,
-        owner: hq.owner,
-        state: 'opened',
-        building
+        owner: null,
+        state: 'openable',
+        icon: generated[i].icon,
+        price: generated[i].price
       }
     }
 
-    return results
+    return generated
   }
 }
 
@@ -691,6 +678,7 @@ const VictorySystem = {
   init() {
     this.countdown = this.INITIAL_COUNTDOWN
     this.hqHp = { player: this.INITIAL_HQ_HP, ai: this.INITIAL_HQ_HP }
+    this.destroyedBuildings = { player: 0, ai: 0 }
     this.gameOver = null
     this.wave = null
   },
@@ -737,8 +725,43 @@ const VictorySystem = {
     if (this.gameOver) return
     const playerCount = TerritorySystem.count('player')
     const aiCount = TerritorySystem.count('ai')
-    const winner = playerCount >= aiCount ? 'player' : 'ai'
+    let winner
+    if (playerCount > aiCount) {
+      winner = 'player'
+    } else if (aiCount > playerCount) {
+      winner = 'ai'
+    } else {
+      const playerHp = this._sumBuildingHp(tiles, 'player')
+      const aiHp = this._sumBuildingHp(tiles, 'ai')
+      if (playerHp > aiHp) winner = 'player'
+      else if (aiHp > playerHp) winner = 'ai'
+      else {
+        const playerGold = ResourceSystem.gold.player
+        const aiGold = ResourceSystem.gold.ai
+        if (playerGold > aiGold) winner = 'player'
+        else if (aiGold > playerGold) winner = 'ai'
+        else {
+          const playerDestroyed = this.destroyedBuildings.player
+          const aiDestroyed = this.destroyedBuildings.ai
+          winner = playerDestroyed >= aiDestroyed ? 'player' : 'ai'
+        }
+      }
+    }
     this.gameOver = { winner, reason: 'countdown' }
+  },
+
+  _sumBuildingHp(tiles, owner) {
+    let total = 0
+    for (const hexId of Object.keys(tiles)) {
+      const tile = tiles[hexId]
+      if (!tile || tile.owner !== owner || !tile.building) continue
+      if (tile.building.hp !== undefined) total += tile.building.hp
+    }
+    return total
+  },
+
+  addDestroyedBuilding(owner) {
+    this.destroyedBuildings[owner] = (this.destroyedBuildings[owner] || 0) + 1
   },
 
   _hexDist(aHexId, bHexId) {
@@ -968,7 +991,6 @@ const CombatSystem = {
     if (best) {
       best.hp -= atk
       b.attackCd = this.ATTACK_CD
-      tile.lastAttacker = tile.owner
     }
   },
 
@@ -1003,10 +1025,13 @@ const CombatSystem = {
     if (tile.building && tile.building.type === 'barracks') {
       BarracksSystem.destroyBarracks(hexId)
     }
+    const attacker = tile.lastAttacker
     if (tile.building && tile.building.type === 'hq') {
+      if (attacker) VictorySystem.addDestroyedBuilding(attacker)
       tile.building = null
       return
     }
+    if (attacker) VictorySystem.addDestroyedBuilding(attacker)
     RuinSystem.createRuin(hexId, tiles)
   },
 
@@ -1265,6 +1290,7 @@ const ClickHandler = {
 
     tile.owner = player
     tile.state = 'opened'
+    TerritorySystem.owners[`${tile.q},${tile.r}`] = player
     delete tile.icon
     delete tile.price
 
@@ -1350,7 +1376,8 @@ const AIBehavior = {
     for (const hexId of Object.keys(tiles)) {
       const tile = tiles[hexId]
       if (!tile) continue
-      if (tile.state === 'openable' && tile.owner === side) {
+      if (tile.state === 'openable' && (tile.owner === side || tile.owner === null)) {
+        if (tile.owner === null && !this._isAdjacentToOwnedTile(tile, tiles, side)) continue
         actions.push({ type: 'open_tile', tile, cost: tile.price })
       }
       if (tile.state === 'opened' && tile.owner === side && tile.building
@@ -1362,6 +1389,15 @@ const AIBehavior = {
       }
     }
     return actions
+  },
+
+  _isAdjacentToOwnedTile(tile, tiles, owner) {
+    const neighbors = HexGrid.getNeighbors(tile.q, tile.r)
+    for (const n of neighbors) {
+      const nt = tiles[`${n.q},${n.r}`]
+      if (nt && nt.owner === owner) return true
+    }
+    return false
   },
 
   scoreAction(action, tiles) {
@@ -1434,11 +1470,14 @@ const AIBehavior = {
     if (action.type === 'wait') return
     if (action.type === 'open_tile') {
       const { tile } = action
-      if (!tile || tile.state !== 'openable' || tile.owner !== this.SIDE) return
+      if (!tile || tile.state !== 'openable'
+          || (tile.owner !== this.SIDE && tile.owner !== null)) return
       if (!ResourceSystem.trySpend(this.SIDE, tile.price)) return
       const result = TileSystem.open(
         { icon: tile.icon, price: tile.price }, rng)
+      tile.owner = this.SIDE
       tile.state = 'opened'
+      TerritorySystem.owners[`${tile.q},${tile.r}`] = this.SIDE
       delete tile.icon
       delete tile.price
       this._applyOpenResult(tile, result)
@@ -1557,24 +1596,11 @@ function initGameState() {
   VictorySystem.init()
   AIBehavior.init()
 
-  for (const hexId of Object.keys(tiles)) {
-    const tile = tiles[hexId]
-    if (tile && tile.building && tile.building.type === 'barracks') {
-      BarracksSystem.registerBarracks(hexId)
-    }
-    if (tile && tile.building && (tile.building.type === 'archer_tower' || tile.building.type === 'hq')) {
-      const spec = BuildingTypes.getSpec(tile.building.type, tile.building.priceTier)
-      if (spec && tile.building.atk === undefined) tile.building.atk = spec.atk
-      if (spec && tile.building.range === undefined) tile.building.range = spec.range
-    }
-  }
+  // 开局只有两个 HQ 格登记进 TerritorySystem
+  TerritorySystem.owners[playerHqId] = 'player'
+  TerritorySystem.owners[aiHqId] = 'ai'
 
-  // 开局已归属格子（HQ + 周围建筑）登记进 TerritorySystem，使地块数从开局即正确
-  for (const hexId of Object.keys(tiles)) {
-    const tile = tiles[hexId]
-    if (tile && tile.owner) TerritorySystem.owners[hexId] = tile.owner
-  }
-
+  // 激活与 HQ 相邻的格子为 openable
   TileSystem.activateOpenableTiles(tiles, SeededRNG)
 
   return { tiles }
@@ -2718,31 +2744,32 @@ render()
   const hq = { q: 4, r: 10, owner: 'player' }
   const results = OpeningLayout.generateOpening(hq, testTiles, SeededRNG)
   console.assert(results.length === 6,
-    `开局应生成 6 个建筑格，实际 ${results.length}`)
+    `开局应生成 6 个可开格，实际 ${results.length}`)
 
-  const neighbors = HexGrid.getNeighbors(4, 11)
-  let openedCount = 0
+  const neighbors = HexGrid.getNeighbors(4, 10)
+  let openableCount = 0
   for (const n of neighbors) {
     const tile = testTiles[`${n.q},${n.r}`]
-    if (tile && tile.state === 'opened' && tile.building) openedCount++
+    if (tile && tile.state === 'openable' && tile.owner === null) openableCount++
   }
-  console.assert(openedCount === 6,
-    `HQ 周围应有 6 个 opened 建筑格，实际 ${openedCount}`)
+  console.assert(openableCount === 6,
+    `HQ 周围应有 6 个中立 openable 格，实际 ${openableCount}`)
 
-  const validTypes = ['barracks', 'archer_tower', 'gold_mine']
-  console.assert(results.every(t => validTypes.includes(t)),
-    `所有建筑类型应有效，实际: ${results.join(', ')}`)
+  const validIcons = ['?', 'helmet', 'shield', 'metal']
+  console.assert(results.every(r => validIcons.includes(r.icon) && r.price > 0),
+    `每格应有有效图标和价格`)
 
   for (const n of neighbors) {
     const tile = testTiles[`${n.q},${n.r}`]
-    if (tile && tile.building && tile.building.type === 'barracks') {
-      console.assert(['green','blue','purple','gold'].includes(tile.building.tier),
-        `开局兵营应有 tier，实际 ${tile.building.tier}`)
+    if (tile) {
+      console.assert(tile.icon && tile.price,
+        `openable 格应有 icon 和 price，实际: icon=${tile.icon}, price=${tile.price}`)
     }
   }
 
-  let mineCount = 0
+  // 保底测试：1000 次开局，每次都应至少有 1 格是 ⚙️+25金
   const TRIALS = 1000
+  let guaranteePass = 0
   for (let trial = 0; trial < TRIALS; trial++) {
     SeededRNG.init(trial * 7 + 13)
     const freshTiles = {}
@@ -2753,12 +2780,12 @@ render()
     }
     freshTiles['4,10'] = { q: 4, r: 10, owner: 'player', state: 'opened', building: { type: 'hq' } }
     const r = OpeningLayout.generateOpening(hq, freshTiles, SeededRNG)
-    if (r.some(b => b === 'gold_mine')) mineCount++
+    if (r.some(g => g.icon === 'metal' && g.price === 25)) guaranteePass++
   }
-  const mineRate = mineCount / TRIALS
-  console.assert(mineRate >= 0.65 && mineRate <= 0.75,
-    `≥1 金矿频率应在 65%-75%，实际 ${(mineRate * 100).toFixed(1)}%`)
+  console.assert(guaranteePass === TRIALS,
+    `保底应 100% 触发（≥1 ⚙️+25金），实际 ${guaranteePass}/${TRIALS}`)
 
+  // 同 seed 一致性
   SeededRNG.init(999)
   const tiles1 = {}
   for (let r = 0; r < HexGrid.ROWS; r++) {
@@ -2781,6 +2808,7 @@ render()
   console.assert(JSON.stringify(res1) === JSON.stringify(res2),
     '同 seed 开局结果应完全一致')
 
+  // AI 侧也生成中立 openable
   SeededRNG.init(42)
   const tiles3 = {}
   for (let r = 0; r < HexGrid.ROWS; r++) {
@@ -2793,12 +2821,12 @@ render()
   OpeningLayout.generateOpening({ q: 4, r: 10, owner: 'player' }, tiles3, SeededRNG)
   OpeningLayout.generateOpening({ q: 4, r: 1, owner: 'ai' }, tiles3, SeededRNG)
   const aiNeighbors = HexGrid.getNeighbors(4, 1)
-  const aiOpened = aiNeighbors.filter(n => {
+  const aiOpenable = aiNeighbors.filter(n => {
     const t = tiles3[`${n.q},${n.r}`]
-    return t && t.state === 'opened' && t.owner === 'ai' && t.building
+    return t && t.state === 'openable' && t.owner === null
   })
-  console.assert(aiOpened.length === 6,
-    `AI 方也应有 6 个 opened 建筑格，实际 ${aiOpened.length}`)
+  console.assert(aiOpenable.length === 6,
+    `AI 方也应有 6 个中立 openable 格，实际 ${aiOpenable.length}`)
 
   console.log('[test] OpeningLayout tests passed')
 })()
@@ -3095,28 +3123,26 @@ render()
     `同 seed 两次开局应完全一致，不匹配数: ${mismatch}`)
 
   const playerHqNeighbors = HexGrid.getNeighbors(PLAYER_HQ.q, PLAYER_HQ.r)
-  let playerOpenedBuildings = 0
+  let playerOpenableTiles = 0
   for (const n of playerHqNeighbors) {
     const tile = gs1.tiles[`${n.q},${n.r}`]
-    if (tile && tile.state === 'opened' && tile.building
-        && tile.building.type !== 'hq' && tile.owner === 'player') {
-      playerOpenedBuildings++
+    if (tile && tile.state === 'openable' && tile.owner === null) {
+      playerOpenableTiles++
     }
   }
-  console.assert(playerOpenedBuildings === 6,
-    `玩家 HQ 周围应有 6 个已开建筑格，实际 ${playerOpenedBuildings}`)
+  console.assert(playerOpenableTiles === 6,
+    `玩家 HQ 周围应有 6 个中立 openable 格，实际 ${playerOpenableTiles}`)
 
   const aiHqNeighbors = HexGrid.getNeighbors(AI_HQ.q, AI_HQ.r)
-  let aiOpenedBuildings = 0
+  let aiOpenableTiles = 0
   for (const n of aiHqNeighbors) {
     const tile = gs1.tiles[`${n.q},${n.r}`]
-    if (tile && tile.state === 'opened' && tile.building
-        && tile.building.type !== 'hq' && tile.owner === 'ai') {
-      aiOpenedBuildings++
+    if (tile && tile.state === 'openable' && tile.owner === null) {
+      aiOpenableTiles++
     }
   }
-  console.assert(aiOpenedBuildings === 6,
-    `AI HQ 周围应有 6 个已开建筑格，实际 ${aiOpenedBuildings}`)
+  console.assert(aiOpenableTiles === 6,
+    `AI HQ 周围应有 6 个中立 openable 格，实际 ${aiOpenableTiles}`)
 
   let openableCount = 0
   for (const hexId of Object.keys(gs1.tiles)) {
