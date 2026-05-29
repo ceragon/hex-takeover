@@ -70,24 +70,19 @@ function createGameLoop(updateFn) {
 }
 
 // ============================================================
-// HexGrid: 9 列 × 12 行 + 1 行中央湖水（r=LAKE_ROW）的平顶六边形网格
-// 坐标系：axial (q, r)，q ∈ [0, COLS)，r ∈ [0, ROWS)，r=LAKE_ROW 为湖水
-// 平顶六边形，odd-r 水平偏移布局
+// HexGrid: 9 列 × 12 行的尖顶(pointy-top)六边形网格
+// 坐标系：axial (q, r)，q ∈ [0, COLS)，r ∈ [0, ROWS)
+// 尖顶(pointy-top)六边形，odd-r 水平偏移布局
 // ============================================================
 const HexGrid = {
   COLS: 9,
-  ROWS: 13,
-  LAKE_ROW: 6,
-  hexSize: 20,
+  ROWS: 12,
+  hexSize: 32,
 
   isInBounds(q, r) {
     return Number.isInteger(q) && Number.isInteger(r)
       && q >= 0 && q < this.COLS
       && r >= 0 && r < this.ROWS
-  },
-
-  isLake(q, r) {
-    return r === this.LAKE_ROW && q >= 0 && q < this.COLS
   },
 
   generateCoords() {
@@ -100,12 +95,13 @@ const HexGrid = {
     return coords
   },
 
-  // 轴向坐标 → 像素中心点（平地公式，湖水行以下整体下移半个六边形高度作为视觉间隔）
+  // offset 坐标 → 像素中心点（尖顶 odd-r：奇数行右移半格，矩形网格不剪切）
   axialToPixel(q, r) {
     const size = this.hexSize
-    const lakeGap = (r > this.LAKE_ROW ? 1 : 0) * size * Math.sqrt(3) * 0.5
-    const x = size * (Math.sqrt(3) * q + Math.sqrt(3) / 2 * r)
-    const y = size * (1.5 * r) + lakeGap
+    const hexW = Math.sqrt(3) * size
+    const hexH = 1.5 * size
+    const x = hexW * (q + 0.5 * (r & 1))
+    const y = hexH * r
     return { x, y }
   },
 
@@ -113,39 +109,29 @@ const HexGrid = {
     return this.axialToPixel(q, r)
   },
 
-  // 像素点 → 最近的轴向坐标（cube rounding + 湖水偏移反算 + 边界钳制）
+  // 像素点 → 最近的 offset 坐标（尖顶 odd-r 反算）
   pixelToAxial(px, py) {
     const size = this.hexSize
-    const lakeOffsetY = this.hexSize * Math.sqrt(3) * 0.5
-    let adjustedY = py
-    if (py > this.axialToPixel(0, this.LAKE_ROW).y + lakeOffsetY * 0.5) {
-      adjustedY -= lakeOffsetY
+    const hexW = Math.sqrt(3) * size
+    const hexH = 1.5 * size
+    // 先粗估行，再按该行的半格偏移反算列，最后在候选格中取最近
+    const rApprox = Math.round(py / hexH)
+    let best = null
+    let bestD = Infinity
+    for (let dr = -1; dr <= 1; dr++) {
+      const r = rApprox + dr
+      const qApprox = Math.round(px / hexW - 0.5 * (r & 1))
+      for (let dq = -1; dq <= 1; dq++) {
+        const q = qApprox + dq
+        const c = this.axialToPixel(q, r)
+        const d = (c.x - px) ** 2 + (c.y - py) ** 2
+        if (d < bestD) { bestD = d; best = { q, r } }
+      }
     }
-
-    const fq = (Math.sqrt(3) / 3 * px - 1 / 3 * adjustedY) / size
-    const fr = (2 / 3 * adjustedY) / size
-
-    let x = fq
-    let z = fr
-    let y = -x - z
-    let rx = Math.round(x)
-    let ry = Math.round(y)
-    let rz = Math.round(z)
-    const dx = Math.abs(rx - x)
-    const dy = Math.abs(ry - y)
-    const dz = Math.abs(rz - z)
-    if (dx > dy && dx > dz) rx = -ry - rz
-    else if (dy > dz) ry = -rx - rz
-    else rz = -rx - ry
-
-    let q = rx
-    let r = rz
-    if (r === this.LAKE_ROW) r = py < this.axialToPixel(0, this.LAKE_ROW).y ? this.LAKE_ROW - 1 : this.LAKE_ROW + 1
-    return { q, r }
+    return best
   },
 
   // 返回 (q, r) 的 6 个邻居，过滤掉越界格；输入若越界返回 []
-  // 湖水格 (r=LAKE_ROW) 是视觉装饰，不作为移动屏障，正常参与邻居计算
   getNeighbors(q, r) {
     if (!this.isInBounds(q, r)) return []
     const offsets = (r % 2 === 0)
@@ -162,11 +148,10 @@ const HexGrid = {
     return result
   },
 
-  // 像素坐标命中查询：返回最近的非湖水格子；点中湖水或越界返回 null
+  // 像素坐标命中查询：返回最近的格子；越界返回 null
   findHexAt(px, py) {
     const hex = this.pixelToAxial(px, py)
     if (!this.isInBounds(hex.q, hex.r)) return null
-    if (this.isLake(hex.q, hex.r)) return null
     return hex
   }
 }
@@ -325,7 +310,7 @@ const OpeningLayout = {
   generateOpening(hq, tiles, rng) {
     const neighbors = HexGrid.getNeighbors(hq.q, hq.r)
     const slots = neighbors.filter(n =>
-      HexGrid.isInBounds(n.q, n.r) && !HexGrid.isLake(n.q, n.r)
+      HexGrid.isInBounds(n.q, n.r)
     )
 
     const results = []
@@ -554,7 +539,7 @@ const BarracksSystem = {
 // ============================================================
 const TerritorySystem = {
   owners: {},
-  total: HexGrid.COLS * HexGrid.ROWS - HexGrid.COLS,
+  total: HexGrid.COLS * HexGrid.ROWS,
 
   init() {
     this.owners = {}
@@ -1540,7 +1525,7 @@ const DeathEffect = {
 // ============================================================
 // v2 GameState（格子状态机 + 开局布局 + 经济系统 + 兵营吐兵）
 // ============================================================
-const PLAYER_HQ = { q: 4, r: 11, owner: 'player' }
+const PLAYER_HQ = { q: 4, r: 10, owner: 'player' }
 const AI_HQ = { q: 4, r: 1, owner: 'ai' }
 
 function initGameState() {
@@ -1618,8 +1603,20 @@ resizeCanvas()
 // 顶部/底部 HUD 栏高度（canvas 内绘制，地图区夹在中间）
 const TOP_BAR_HEIGHT = 110
 const BOTTOM_BAR_HEIGHT = 90
-// 网格在地图区内居中（hexSize=20，9×12+湖水，竖屏 540×960）
-const RENDER_OFFSET = { x: 27.5, y: 301 }
+// 网格在地图区内动态居中（根据 hexSize 自动计算）
+const RENDER_OFFSET = (function() {
+  const s = HexGrid.hexSize
+  const hexW = Math.sqrt(3) * s
+  const hexH = 1.5 * s
+  // odd-r 奇数行右移半格，总宽度 = hexW * (COLS-1+0.5) + hexW（含两侧边缘）
+  const gridW = hexW * (HexGrid.COLS - 0.5)
+  const gridH = hexH * (HexGrid.ROWS - 1) + 2 * s
+  const mapAreaH = 960 - TOP_BAR_HEIGHT - BOTTOM_BAR_HEIGHT
+  return {
+    x: Math.round((540 - gridW) / 2),
+    y: Math.round(TOP_BAR_HEIGHT + (mapAreaH - gridH) / 2 + s)
+  }
+})()
 
 const TIER_COLORS = {
   green:  '#4a8',
@@ -1633,10 +1630,107 @@ const OWNER_UNIT_COLOR = {
   ai:     '#f66'
 }
 
-function drawHex(cx, cy, size, fillColor, strokeColor = '#333') {
+// 鲜亮风格格子配色（己方绿 / 敌方红 / 中立灰 / 废墟褐）
+const TILE_COLORS = {
+  playerOpened:   '#7ec850',
+  playerOpenable: '#7ec850',
+  playerInactive: '#2a5a2a',
+  aiOpened:       '#e85545',
+  aiOpenable:     '#e85545',
+  aiInactive:     '#5a2a2a',
+  neutral:        '#888898',
+  ruin:           '#3a2a1a'
+}
+
+// 描边色（同色系略暗）
+const TILE_STROKES = {
+  playerOpened:   '#5aa838',
+  playerOpenable: '#5aa838',
+  playerInactive: '#1d401d',
+  aiOpened:       '#c43a2e',
+  aiOpenable:     '#c43a2e',
+  aiInactive:     '#401d1d',
+  neutral:        '#666678',
+  ruin:           '#281c10'
+}
+
+// 可开格子图标 → emoji
+const ICON_EMOJI = { '?': '❓', helmet: '🪖', shield: '🛡️', metal: '⚙️' }
+
+// 价格档 → pill 背景色
+const PRICE_PILL_COLOR = { 25: '#e8c840', 50: '#e8c840', 100: '#e88830', 250: '#e84040' }
+
+// 建筑类型 → emoji（HQ 走程序化绘制，不在此表）
+const BUILDING_EMOJI = { barracks: '⚔️', archer_tower: '🏹', gold_mine: '⛏️' }
+
+// 兵种 key → emoji
+const UNIT_EMOJI = { skeleton: '💀', wolf: '🐺', warrior: '⚔️', archer: '🏹', cavalry: '🐎', dragon: '🐉' }
+
+// 圆角矩形路径（只画路径，调用者负责 fill/stroke）
+function roundRect(c, x, y, w, h, r) {
+  c.beginPath()
+  c.moveTo(x + r, y)
+  c.arcTo(x + w, y, x + w, y + h, r)
+  c.arcTo(x + w, y + h, x, y + h, r)
+  c.arcTo(x, y + h, x, y, r)
+  c.arcTo(x, y, x + w, y, r)
+  c.closePath()
+}
+
+// 价格 pill：圆角矩形底 + 白字价格
+function drawPricePill(cx, cy, price) {
+  const txt = `${price}`
+  ctx.font = 'bold 13px monospace'
+  const tw = ctx.measureText(txt).width
+  const padX = 7
+  const w = tw + padX * 2
+  const h = 18
+  roundRect(ctx, cx - w / 2, cy - h / 2, w, h, h / 2)
+  ctx.fillStyle = PRICE_PILL_COLOR[price] || '#e8c840'
+  ctx.fill()
+  ctx.lineWidth = 1
+  ctx.strokeStyle = 'rgba(0,0,0,0.35)'
+  ctx.stroke()
+  ctx.fillStyle = '#3a2a00'
+  ctx.textAlign = 'center'
+  ctx.textBaseline = 'middle'
+  ctx.fillText(txt, cx, cy + 0.5)
+}
+
+// HQ 程序化石墙城堡轮廓
+function drawHQCastle(cx, cy, size) {
+  ctx.save()
+  // 城墙主体
+  const w = size * 1.1
+  const top = cy - size * 0.4
+  const bot = cy + size * 0.55
+  ctx.fillStyle = '#c8c0b0'
+  ctx.strokeStyle = '#6a6258'
+  ctx.lineWidth = 1.5
+  roundRect(ctx, cx - w / 2, top, w, bot - top, 2)
+  ctx.fill()
+  ctx.stroke()
+  // 城垛
+  const merlonW = w / 5
+  ctx.fillStyle = '#d8d0c0'
+  for (let i = 0; i < 3; i++) {
+    const mx = cx - w / 2 + merlonW * (i * 1.5 + 0.25)
+    ctx.fillRect(mx, top - merlonW * 0.7, merlonW, merlonW * 0.8)
+    ctx.strokeRect(mx, top - merlonW * 0.7, merlonW, merlonW * 0.8)
+  }
+  // 中央塔门
+  ctx.fillStyle = '#5a4a3a'
+  const doorW = w * 0.28
+  roundRect(ctx, cx - doorW / 2, cy + size * 0.05, doorW, bot - (cy + size * 0.05), doorW / 2)
+  ctx.fill()
+  ctx.restore()
+}
+
+// 尖顶(pointy-top)六边形：平边在左右，尖角朝上下
+function drawHex(cx, cy, size, fillColor, strokeColor = null) {
   ctx.beginPath()
   for (let i = 0; i < 6; i++) {
-    const angle = Math.PI / 180 * (60 * i)
+    const angle = Math.PI / 180 * (60 * i - 30)
     const x = cx + size * Math.cos(angle)
     const y = cy + size * Math.sin(angle)
     if (i === 0) ctx.moveTo(x, y)
@@ -1645,9 +1739,17 @@ function drawHex(cx, cy, size, fillColor, strokeColor = '#333') {
   ctx.closePath()
   ctx.fillStyle = fillColor
   ctx.fill()
-  ctx.strokeStyle = strokeColor
-  ctx.lineWidth = 1
-  ctx.stroke()
+  // 顶部高光（上 1/3 区域）
+  ctx.save()
+  ctx.clip()
+  ctx.fillStyle = 'rgba(255,255,255,0.13)'
+  ctx.fillRect(cx - size, cy - size, size * 2, size * 0.9)
+  ctx.restore()
+  if (strokeColor) {
+    ctx.strokeStyle = strokeColor
+    ctx.lineWidth = 1
+    ctx.stroke()
+  }
 }
 
 function drawHexLabel(cx, cy, text, fontSize = 10, color = '#fff') {
@@ -1665,11 +1767,6 @@ function renderGrid() {
   ctx.fillStyle = '#0a0a1a'
   ctx.fillRect(0, 0, canvas.width, canvas.height)
 
-  const lakeY = HexGrid.axialToPixel(0, HexGrid.LAKE_ROW).y
-  const lakeBandHeight = size * Math.sqrt(3) * 0.5
-  ctx.fillStyle = '#1e3a5f'
-  ctx.fillRect(0, lakeY - lakeBandHeight / 2, canvas.width, lakeBandHeight)
-
   function hpColor(ratio) {
     if (ratio > 0.6) return '#3c6'
     if (ratio > 0.3) return '#ec3'
@@ -1684,7 +1781,6 @@ function renderGrid() {
   }
 
   for (let r = 0; r < HexGrid.ROWS; r++) {
-    if (r === HexGrid.LAKE_ROW) continue
     for (let q = 0; q < HexGrid.COLS; q++) {
       const { x, y } = HexGrid.axialToPixel(q, r)
       const cx = x + RENDER_OFFSET.x
@@ -1692,92 +1788,122 @@ function renderGrid() {
       const hexId = `${q},${r}`
       const tile = tiles[hexId]
 
-      let color = '#3a3a5a'
-      let label = ''
-      let labelSize = 10
-      let subLabel = ''
+      // 颜色 + 内容决策
+      let color, stroke
+      let iconEmoji = ''   // 浮上方的图标 emoji
+      let pricePill = null // 价格 pill 数值
+      let cornerBadge = '' // 右上角标（品阶/等级）
+      let drawCastle = false
+      let buildingEmoji = ''
+
+      const ownerKey = tile.owner === 'player' ? 'player' : (tile.owner === 'ai' ? 'ai' : null)
 
       if (tile.ruin) {
-        color = '#3a2a1a'
-        label = '废'
-        labelSize = 10
+        color = TILE_COLORS.ruin
+        stroke = TILE_STROKES.ruin
+        iconEmoji = '💥'
       } else if (tile.state === 'opened' && tile.building) {
+        color = ownerKey === 'player' ? TILE_COLORS.playerOpened : TILE_COLORS.aiOpened
+        stroke = ownerKey === 'player' ? TILE_STROKES.playerOpened : TILE_STROKES.aiOpened
         if (tile.building.type === 'hq') {
-          color = tile.owner === 'player' ? '#2266cc' : '#cc2222'
-          label = tile.owner === 'player' ? '己方HQ' : '敌方HQ'
-          labelSize = 9
+          drawCastle = true
         } else if (tile.building.type === 'barracks') {
-          color = tile.owner === 'player' ? '#1a5a2a' : '#5a1a1a'
+          buildingEmoji = BUILDING_EMOJI.barracks
           const tierMap = { green: '绿', blue: '蓝', purple: '紫', gold: '金' }
-          label = tile.building.card ? '卡' : '兵'
-          subLabel = tierMap[tile.building.tier] || ''
+          cornerBadge = tierMap[tile.building.tier] || ''
         } else if (tile.building.type === 'archer_tower') {
-          color = tile.owner === 'player' ? '#1a4a3a' : '#4a1a2a'
-          label = '塔'
-          subLabel = tile.building.priceTier === 100 ? 'II' : 'I'
+          buildingEmoji = BUILDING_EMOJI.archer_tower
+          if ((tile.building.level || 0) > 0) cornerBadge = `L${tile.building.level}`
         } else if (tile.building.type === 'gold_mine') {
-          color = tile.owner === 'player' ? '#4a4a1a' : '#4a2a1a'
-          label = '矿'
+          buildingEmoji = BUILDING_EMOJI.gold_mine
+          if ((tile.building.level || 0) > 0) cornerBadge = `L${tile.building.level}`
         }
       } else if (tile.state === 'opened') {
-        color = tile.owner === 'player' ? '#2a2a3a' : (tile.owner === 'ai' ? '#3a2a2a' : '#2a2a3a')
-        label = '空'
+        // 已开但无建筑（空）
+        color = ownerKey === 'player' ? TILE_COLORS.playerOpened
+              : (ownerKey === 'ai' ? TILE_COLORS.aiOpened : TILE_COLORS.neutral)
+        stroke = ownerKey === 'player' ? TILE_STROKES.playerOpened
+              : (ownerKey === 'ai' ? TILE_STROKES.aiOpened : TILE_STROKES.neutral)
       } else if (tile.state === 'openable') {
-        color = '#4a3a6a'
-        const iconMap = { '?': '?', 'helmet': '盔', 'shield': '盾', 'metal': '金' }
-        label = iconMap[tile.icon] || '?'
-        subLabel = `${tile.price}`
+        if (ownerKey === 'ai') {
+          // 敌方可开格：统一恶魔脸，不暴露图标/价格
+          color = TILE_COLORS.aiOpenable
+          stroke = TILE_STROKES.aiOpenable
+          iconEmoji = '😈'
+        } else {
+          // 我方可开格：具体图标 + 价格 pill
+          color = TILE_COLORS.playerOpenable
+          stroke = TILE_STROKES.playerOpenable
+          iconEmoji = ICON_EMOJI[tile.icon] || '❓'
+          pricePill = tile.price
+        }
       } else {
-        color = '#222233'
+        // 未激活：暗色锁定态，无图标
+        color = ownerKey === 'player' ? TILE_COLORS.playerInactive
+              : (ownerKey === 'ai' ? TILE_COLORS.aiInactive : TILE_COLORS.neutral)
+        stroke = ownerKey === 'player' ? TILE_STROKES.playerInactive
+              : (ownerKey === 'ai' ? TILE_STROKES.aiInactive : TILE_STROKES.neutral)
       }
 
-      // 领地变更闪烁效果（3 ticks 渐变过渡）
+      // 领地变更闪烁效果
       if (tile.flashTicks && tile.flashTicks > 0) {
         color = brightenHexColor(color, 80)
         tile.flashTicks--
       }
 
-      drawHex(cx, cy, size - 1, color)
-      if (label) drawHexLabel(cx, cy - (subLabel ? 4 : 0), label, labelSize, '#fff')
-      if (subLabel) {
-        const subSize = 9
-        ctx.font = `${subSize}px monospace`
-        ctx.textAlign = 'center'
-        const tw = ctx.measureText(subLabel).width
-        ctx.fillStyle = 'rgba(0,0,0,0.5)'
-        ctx.fillRect(cx - tw / 2 - 2, cy + 5, tw + 4, subSize + 2)
-        drawHexLabel(cx, cy + 9, subLabel, subSize, '#ffcc44')
+      drawHex(cx, cy, size - 0.5, color, stroke)
+
+      if (drawCastle) {
+        drawHQCastle(cx, cy, size)
+      } else {
+        if (buildingEmoji) {
+          ctx.font = '20px serif'
+          ctx.textAlign = 'center'
+          ctx.textBaseline = 'middle'
+          ctx.fillText(buildingEmoji, cx, cy - 1)
+        } else if (iconEmoji) {
+          ctx.font = '20px serif'
+          ctx.textAlign = 'center'
+          ctx.textBaseline = 'middle'
+          ctx.fillText(iconEmoji, cx, pricePill ? cy - 6 : cy)
+        }
+        if (pricePill != null) drawPricePill(cx, cy + 13, pricePill)
+        if (cornerBadge) {
+          ctx.font = 'bold 11px monospace'
+          ctx.textAlign = 'center'
+          ctx.textBaseline = 'middle'
+          const bw = ctx.measureText(cornerBadge).width + 6
+          roundRect(ctx, cx + size * 0.35 - bw / 2, cy - size * 0.7, bw, 14, 4)
+          ctx.fillStyle = 'rgba(0,0,0,0.55)'
+          ctx.fill()
+          ctx.fillStyle = '#ffe080'
+          ctx.fillText(cornerBadge, cx + size * 0.35, cy - size * 0.7 + 6)
+        }
       }
 
       // HQ 专属：大号 HP 条显示在格子上方（颜色随血量变化：绿→黄→红）
       if (tile.building && tile.building.type === 'hq') {
         const hpRatio = Math.max(0, (VictorySystem.hqHp[tile.owner] || 0) / VictorySystem.INITIAL_HQ_HP)
         const barW = size * 1.6
-        const barH = 5
+        const barH = 6
         const bx = cx - barW / 2
         const by = cy - size * 0.95
         ctx.fillStyle = '#111'
         ctx.fillRect(bx, by, barW, barH)
         ctx.fillStyle = hpColor(hpRatio)
         ctx.fillRect(bx, by, barW * hpRatio, barH)
-        drawHexLabel(cx, by - 5, `${Math.ceil(VictorySystem.hqHp[tile.owner] || 0)}`, 8, '#fff')
+        drawHexLabel(cx, by - 5, `${Math.ceil(VictorySystem.hqHp[tile.owner] || 0)}`, 10, '#fff')
       } else if (tile.building && tile.building.hp !== undefined && tile.building.maxHp) {
         // 普通建筑 HP 条（颜色随血量变化）
         const hpRatio = Math.max(0, tile.building.hp / tile.building.maxHp)
         const barW = size * 1.2
-        const barH = 3
+        const barH = 4
         const bx = cx - barW / 2
         const by = cy + size * 0.7
         ctx.fillStyle = '#111'
         ctx.fillRect(bx, by, barW, barH)
         ctx.fillStyle = hpColor(hpRatio)
         ctx.fillRect(bx, by, barW * hpRatio, barH)
-      }
-
-      // 升级等级指示（金矿 / 箭塔 Lv.1/2/3）
-      if (tile.building && (tile.building.type === 'gold_mine' || tile.building.type === 'archer_tower')
-          && (tile.building.level || 0) > 0) {
-        drawHexLabel(cx + size * 0.55, cy - size * 0.55, `L${tile.building.level}`, 7, '#ffcc44')
       }
     }
   }
@@ -1812,18 +1938,24 @@ function renderUnits() {
     const sameHexUnits = units.filter(u => u.hexId === unit.hexId && u.owner === unit.owner)
     const idx = sameHexUnits.indexOf(unit)
     const offsetAngle = idx * (Math.PI * 2 / Math.max(sameHexUnits.length, 4))
-    const offsetDist = 4
+    const offsetDist = 6
     const ox = Math.cos(offsetAngle) * offsetDist
     const oy = Math.sin(offsetAngle) * offsetDist
 
-    const radius = unit.tier === 'gold' ? 5 : (unit.tier === 'purple' ? 4 : 3)
+    const ux = cx + ox
+    const uy = cy + oy - 8
+    // 阵营底色圆（提供所属信息）+ 兵种 emoji（负责兵种辨识）
     ctx.beginPath()
-    ctx.arc(cx + ox, cy + oy - 6, radius, 0, Math.PI * 2)
-    ctx.fillStyle = OWNER_UNIT_COLOR[unit.owner] || '#fff'
+    ctx.arc(ux, uy, 9, 0, Math.PI * 2)
+    ctx.fillStyle = unit.owner === 'player' ? 'rgba(60,160,90,0.85)' : 'rgba(200,60,50,0.85)'
     ctx.fill()
-    ctx.strokeStyle = TIER_COLORS[unit.tier] || '#fff'
+    ctx.strokeStyle = unit.owner === 'player' ? '#2a7a45' : '#a02a22'
     ctx.lineWidth = 1.5
     ctx.stroke()
+    ctx.font = '14px serif'
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.fillText(UNIT_EMOJI[unit.key] || '⚔️', ux, uy + 0.5)
   }
 }
 
@@ -1942,52 +2074,72 @@ function renderTopBar() {
   ctx.lineTo(canvas.width, TOP_BAR_HEIGHT)
   ctx.stroke()
 
-  // 头像（程序化绘制圆形 + emoji，零依赖）
+  // 方框头像（程序化绘制 + emoji，零依赖）
   drawAvatar(34, 40, '#6af', '🦸')
   drawAvatar(canvas.width - 34, 40, '#f66', '🤖')
 
-  // 左侧：玩家信息
+  // 左侧：玩家信息（地块数绿字 + 人口灰字）
   const playerTiles = TerritorySystem.count('player')
-  const pop = getPopulationCount('player')
+  const playerPop = getPopulationCount('player')
   ctx.textAlign = 'left'
   ctx.textBaseline = 'middle'
   ctx.font = 'bold 15px monospace'
   ctx.fillStyle = '#eee'
   ctx.fillText('玩家', 62, 28)
-  ctx.font = '14px monospace'
-  ctx.fillStyle = '#6c6'
+  ctx.font = 'bold 14px monospace'
+  ctx.fillStyle = '#7ec850'
   ctx.fillText(`🟩 ${playerTiles}`, 62, 50)
   ctx.fillStyle = '#cc8'
-  ctx.fillText(`👥 ${pop}/${POP_CAP}`, 62, 70)
+  ctx.font = '13px monospace'
+  ctx.fillText(`👥 ${playerPop}/${POP_CAP}`, 62, 70)
 
-  // 右侧：电脑信息（不显示敌方金币）
+  // 右侧：电脑信息（地块数红字 + 人口灰字）
   const aiTiles = TerritorySystem.count('ai')
+  const aiPop = getPopulationCount('ai')
   ctx.textAlign = 'right'
   ctx.font = 'bold 15px monospace'
   ctx.fillStyle = '#eee'
   ctx.fillText('电脑', canvas.width - 62, 28)
-  ctx.font = '14px monospace'
-  ctx.fillStyle = '#e88'
+  ctx.font = 'bold 14px monospace'
+  ctx.fillStyle = '#e85545'
   ctx.fillText(`${aiTiles} 🟥`, canvas.width - 62, 50)
+  ctx.fillStyle = '#cc8'
+  ctx.font = '13px monospace'
+  ctx.fillText(`${aiPop}/${POP_CAP} 👥`, canvas.width - 62, 70)
 
-  // 中央：倒计时
+  // 中央：木框背板 + 倒计时
   const sec = Math.ceil(VictorySystem.countdown)
   const mm = Math.floor(sec / 60)
   const ss = sec % 60
   const timeStr = `${mm}:${String(ss).padStart(2, '0')}`
+  const frameW = 96
+  const frameH = 56
+  const fx = canvas.width / 2 - frameW / 2
+  const fy = 14
+  roundRect(ctx, fx, fy, frameW, frameH, 8)
+  ctx.fillStyle = '#5a3a1a'
+  ctx.fill()
+  ctx.lineWidth = 3
+  ctx.strokeStyle = '#8a5a2a'
+  ctx.stroke()
+  roundRect(ctx, fx + 4, fy + 4, frameW - 8, frameH - 8, 5)
+  ctx.lineWidth = 1
+  ctx.strokeStyle = '#3a2410'
+  ctx.stroke()
+
   ctx.textAlign = 'center'
   ctx.textBaseline = 'middle'
-  ctx.font = 'bold 30px monospace'
+  ctx.font = 'bold 26px monospace'
   if (sec < 30) {
     const flash = Math.floor(tickCount / 5) % 2 === 0
-    ctx.fillStyle = flash ? '#ff0' : '#f22'
+    ctx.fillStyle = flash ? '#ffd24a' : '#f25a3a'
   } else {
-    ctx.fillStyle = '#f44'
+    ctx.fillStyle = '#ffe0a0'
   }
-  ctx.fillText(timeStr, canvas.width / 2, 40)
-  ctx.font = '11px monospace'
-  ctx.fillStyle = '#888'
-  ctx.fillText('时间剩余', canvas.width / 2, 70)
+  ctx.fillText(timeStr, canvas.width / 2, fy + 24)
+  ctx.font = '10px monospace'
+  ctx.fillStyle = '#caa070'
+  ctx.fillText('时间剩余', canvas.width / 2, fy + 44)
   ctx.restore()
 }
 
@@ -2005,21 +2157,27 @@ function renderBottomBar() {
   ctx.stroke()
 
   const badgeY = y0 + BOTTOM_BAR_HEIGHT / 2
+  // 金币徽章：金色圆底 + 外描边 + 内描线 + 🪙
   ctx.beginPath()
   ctx.arc(40, badgeY, 20, 0, Math.PI * 2)
-  ctx.fillStyle = '#3a2f10'
+  ctx.fillStyle = '#c8a020'
   ctx.fill()
   ctx.lineWidth = 3
-  ctx.strokeStyle = '#fc4'
+  ctx.strokeStyle = '#ffe060'
   ctx.stroke()
-  ctx.font = '22px serif'
+  ctx.beginPath()
+  ctx.arc(40, badgeY, 15, 0, Math.PI * 2)
+  ctx.lineWidth = 1
+  ctx.strokeStyle = '#8a6a10'
+  ctx.stroke()
+  ctx.font = '20px serif'
   ctx.textAlign = 'center'
   ctx.textBaseline = 'middle'
   ctx.fillText('🪙', 40, badgeY + 1)
 
   ctx.textAlign = 'left'
   ctx.font = 'bold 26px monospace'
-  ctx.fillStyle = '#fc4'
+  ctx.fillStyle = '#e8c840'
   ctx.fillText(`${ResourceSystem.gold.player}`, 70, badgeY)
   ctx.restore()
 }
@@ -2048,11 +2206,11 @@ function renderNotification() {
   _notificationTicks--
 }
 
-// 程序化头像：彩色圆底 + emoji
+// 程序化头像：方框底 + 色边 + emoji
 function drawAvatar(cx, cy, ringColor, emoji) {
   ctx.save()
-  ctx.beginPath()
-  ctx.arc(cx, cy, 22, 0, Math.PI * 2)
+  const s = 44
+  roundRect(ctx, cx - s / 2, cy - s / 2, s, s, 6)
   ctx.fillStyle = '#222'
   ctx.fill()
   ctx.lineWidth = 3
@@ -2299,21 +2457,13 @@ function startGameWithDifficulty(mode) {
 render()
 
 // ============================================================
-// Embedded assertions: HexGrid (v2 — 9×12 + 湖水)
+// Embedded assertions: HexGrid (v2 — 9×12 尖顶网格，无湖水)
 // ============================================================
 ;(function testHexGrid() {
   const coords = HexGrid.generateCoords()
-  console.assert(coords.length === 9 * 13, `应生成 117 个格子，实际 ${coords.length}`)
+  console.assert(coords.length === 9 * 12, `应生成 108 个格子，实际 ${coords.length}`)
 
-  for (let q = 0; q < 9; q++) {
-    console.assert(HexGrid.isLake(q, 6) === true, `(${q},6) 应为湖水`)
-  }
-  console.assert(HexGrid.isLake(0, 0) === false, '(0,0) 不是湖水')
-  console.assert(HexGrid.isLake(4, 12) === false, 'HQ 所在行不是湖水')
-  console.assert(HexGrid.isLake(0, 7) === false, '(0,7) 不是湖水')
-
-  for (let r = 0; r < 13; r++) {
-    if (r === 6) continue
+  for (let r = 0; r < 12; r++) {
     for (let q = 0; q < 9; q++) {
       const px = HexGrid.axialToPixel(q, r)
       const back = HexGrid.pixelToAxial(px.x, px.y)
@@ -2324,10 +2474,6 @@ render()
 
   const p00 = HexGrid.axialToPixel(0, 0)
   console.assert(p00.x === 0 && p00.y === 0, 'axialToPixel(0,0) 应为 (0,0)')
-  const y5 = HexGrid.axialToPixel(0, 5).y
-  const y7 = HexGrid.axialToPixel(0, 7).y
-  console.assert(y7 - y5 > HexGrid.hexSize * 2,
-    `湖水两侧 y 间距应大于 2*size，实际 ${(y7 - y5).toFixed(1)}`)
 
   const corner = HexGrid.getNeighbors(0, 0)
   console.assert(corner.length === 3, `角落 (0,0) 应有 3 个邻居，实际 ${corner.length}`)
@@ -2339,23 +2485,11 @@ render()
   const mid = HexGrid.getNeighbors(4, 3)
   console.assert(mid.length === 6, `中央 (4,3) 应有 6 个邻居，实际 ${mid.length}`)
 
-  const nearLakeEven = HexGrid.getNeighbors(4, 5)
-  console.assert(nearLakeEven.length === 6,
-    `湖前 (4,5) 应有 6 个邻居（含湖水格），实际 ${nearLakeEven.length}`)
-
-  const nearLakeOdd = HexGrid.getNeighbors(4, 7)
-  console.assert(nearLakeOdd.length === 6,
-    `湖后 (4,7) 应有 6 个邻居（含湖水格），实际 ${nearLakeOdd.length}`)
-
-  const lakeNeighbors = HexGrid.getNeighbors(4, 6)
-  console.assert(lakeNeighbors.length === 6, `湖水格 (4,6) 应有 6 个邻居（可通行），实际 ${lakeNeighbors.length}`)
-
   const cornerTopRight = HexGrid.getNeighbors(8, 0)
   console.assert(cornerTopRight.every(n => n.q <= 8 && n.r >= 0),
     '右上角落邻居不应越界')
 
-  for (let r = 0; r < 13; r++) {
-    if (r === 6) continue
+  for (let r = 0; r < 12; r++) {
     for (let q = 0; q < 9; q++) {
       const px = HexGrid.axialToPixel(q, r)
       const hit = HexGrid.findHexAt(px.x, px.y)
@@ -2376,7 +2510,7 @@ render()
   console.assert(near && near.q === 4 && near.r === 3,
     `中心 30% 偏移应仍命中 (4,3)，实际 (${near && near.q},${near && near.r})`)
 
-  console.log('[test] HexGrid v2 (9×12+lake) tests passed')
+  console.log('[test] HexGrid v2 (9×12) tests passed')
 })()
 
 // ============================================================
@@ -2580,8 +2714,8 @@ render()
       testTiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
     }
   }
-  testTiles['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened', building: { type: 'hq' } }
-  const hq = { q: 4, r: 11, owner: 'player' }
+  testTiles['4,10'] = { q: 4, r: 10, owner: 'player', state: 'opened', building: { type: 'hq' } }
+  const hq = { q: 4, r: 10, owner: 'player' }
   const results = OpeningLayout.generateOpening(hq, testTiles, SeededRNG)
   console.assert(results.length === 6,
     `开局应生成 6 个建筑格，实际 ${results.length}`)
@@ -2617,7 +2751,7 @@ render()
         freshTiles[`${q2},${r2}`] = { q: q2, r: r2, owner: null, state: 'inactive' }
       }
     }
-    freshTiles['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened', building: { type: 'hq' } }
+    freshTiles['4,10'] = { q: 4, r: 10, owner: 'player', state: 'opened', building: { type: 'hq' } }
     const r = OpeningLayout.generateOpening(hq, freshTiles, SeededRNG)
     if (r.some(b => b === 'gold_mine')) mineCount++
   }
@@ -2632,7 +2766,7 @@ render()
       tiles1[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
     }
   }
-  tiles1['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened', building: { type: 'hq' } }
+  tiles1['4,10'] = { q: 4, r: 10, owner: 'player', state: 'opened', building: { type: 'hq' } }
   const res1 = OpeningLayout.generateOpening(hq, tiles1, SeededRNG)
 
   SeededRNG.init(999)
@@ -2642,7 +2776,7 @@ render()
       tiles2[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
     }
   }
-  tiles2['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened', building: { type: 'hq' } }
+  tiles2['4,10'] = { q: 4, r: 10, owner: 'player', state: 'opened', building: { type: 'hq' } }
   const res2 = OpeningLayout.generateOpening(hq, tiles2, SeededRNG)
   console.assert(JSON.stringify(res1) === JSON.stringify(res2),
     '同 seed 开局结果应完全一致')
@@ -2654,9 +2788,9 @@ render()
       tiles3[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
     }
   }
-  tiles3['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened', building: { type: 'hq' } }
+  tiles3['4,10'] = { q: 4, r: 10, owner: 'player', state: 'opened', building: { type: 'hq' } }
   tiles3['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened', building: { type: 'hq' } }
-  OpeningLayout.generateOpening({ q: 4, r: 11, owner: 'player' }, tiles3, SeededRNG)
+  OpeningLayout.generateOpening({ q: 4, r: 10, owner: 'player' }, tiles3, SeededRNG)
   OpeningLayout.generateOpening({ q: 4, r: 1, owner: 'ai' }, tiles3, SeededRNG)
   const aiNeighbors = HexGrid.getNeighbors(4, 1)
   const aiOpened = aiNeighbors.filter(n => {
@@ -3203,9 +3337,9 @@ render()
   console.assert(TerritorySystem.count('ai') === 1,
     `ai count should be 1, got ${TerritorySystem.count('ai')}`)
 
-  // 5. total is non-lake tiles
-  console.assert(TerritorySystem.total === HexGrid.COLS * HexGrid.ROWS - HexGrid.COLS,
-    `total should be ${HexGrid.COLS * HexGrid.ROWS - HexGrid.COLS}, got ${TerritorySystem.total}`)
+  // 5. total is all tiles (9×12)
+  console.assert(TerritorySystem.total === HexGrid.COLS * HexGrid.ROWS,
+    `total should be ${HexGrid.COLS * HexGrid.ROWS}, got ${TerritorySystem.total}`)
 
   // 6. cascade: claiming near owned tile activates inactive neighbors
   TerritorySystem.init()
@@ -3254,15 +3388,15 @@ render()
   console.assert(path2.length === 2,
     `BFS 2 steps away should give path of length 2, got ${path2.length}`)
 
-  // 3. Path crosses lake (lake is passable, visual-only)
+  // 3. Longer multi-step path (连续网格无分隔)
   const path3 = MoveUnits.computeBFS({ q: 4, r: 5 }, { q: 4, r: 7 }, tiles)
   console.assert(path3.length === 2,
-    `BFS across lake should go direct (2 steps), got ${path3.length}`)
+    `BFS 2 rows away should give path of length 2, got ${path3.length}`)
 
-  // 4. Path to lake hex (passable, visual-only)
+  // 4. Adjacent downward hex
   const path4 = MoveUnits.computeBFS({ q: 4, r: 5 }, { q: 4, r: 6 }, tiles)
   console.assert(path4 && path4.length === 1,
-    `BFS to lake hex should return path of length 1, got ${JSON.stringify(path4)}`)
+    `BFS to adjacent hex should return path of length 1, got ${JSON.stringify(path4)}`)
 
   // === Target Selection ===
 

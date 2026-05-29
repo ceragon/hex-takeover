@@ -17,8 +17,8 @@ Deadline: 2026-06-22. Branch from `doc/PRD.md` and `CONTEXT.md`.
 - **Matchup:** Single-player vs AI (PvE)
 - **Rendering:** Canvas 2D, 10Hz fixed timestep via `requestAnimationFrame` + accumulator
 - **State:** Single `GameState` object, immutable updates
-- **Hex layout:** Flat-top hexes, axial coordinates (q, r), odd rows shifted right by half a hex (odd-r offset convention, matches RedBlob Games)
-- **Map:** 9 columns × 13 rows (incl. 1 central lake row at r=6), ~108 playable cells, seed=42 (deterministic)
+- **Hex layout:** Pointy-top hexes, odd-r offset convention (odd rows shifted right by half a hex, matches RedBlob Games)。`axialToPixel`/`pixelToAxial` 用真正的 odd-r offset 像素映射（矩形网格不剪切）；`drawHex` 用 pointy-top 形状（`60*i-30`，平边在左右）
+- **Map:** 9 columns × 12 rows = 108 cells, no lake row, seed=42 (deterministic). HQ: AI r=1, player r=10（均在含 6 邻居的行，开局必出 6 建筑）
 - **Testing:** Embedded `console.assert` IIFE tests at bottom of index.html (count evolves with v2 slices) + manual browser verification
 
 ## v2 Rewrite Strategy
@@ -27,7 +27,7 @@ v2 是"保留骨架、换内脏"的中等规模重构：Canvas 渲染、HexGrid 
 
 | v1 模块 | v2 目标 | 工作量 |
 |---------|---------|-------|
-| `HexGrid` | 扩展到 9×12 + 湖水行 | 小 |
+| `HexGrid` | 9×12 odd-r offset 网格（无湖水） | 小 |
 | `TileReveal` | 重写为 `TileSystem` (未激活/可开/已开状态机，混合池+二次概率) | 大 |
 | `ResourceSystem` | 扩展：多产金源 (HQ/金矿)、多花费 (开地块/升级) | 中 |
 | `moveUnits` | 重写：品阶差异化寻敌 (防守反击/越格/AOE) | 大 |
@@ -75,7 +75,7 @@ Tests are embedded at the bottom (lines ~960-1365): `testHexGrid`, `testTileReve
 
 | 类别 | 值 |
 |------|---|
-| 地图 | 9 列 × 12 行 + 1 行湖水 (~100 格) |
+| 地图 | 9 列 × 12 行 = 108 格（无湖水，odd-r offset 矩形网格） |
 | 开局 | 60 金币，HQ 周围 6 格随机填入建筑 (≥1 金矿概率 70%) |
 | 对局时长 | 3:00 倒计时 |
 | HQ 血量 | 1000 HP |
