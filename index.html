@@ -281,12 +281,14 @@ const TileSystem = {
       const tile = tiles[hexId]
       if (!tile) continue
       if (tile.state !== 'inactive') continue
+      if (!tile.owner) continue
       const neighbors = HexGrid.getNeighbors(tile.q, tile.r)
-      const adjToOwned = neighbors.some(n => {
+      const adjToOwnActive = neighbors.some(n => {
         const nt = tiles[`${n.q},${n.r}`]
-        return nt && (nt.owner === 'player' || nt.owner === 'ai')
+        return nt && nt.owner === tile.owner
+          && (nt.state === 'opened' || nt.state === 'openable')
       })
-      if (adjToOwned) {
+      if (adjToOwnActive) {
         const { icon, price } = this.assignTileRng(rng)
         tile.state = 'openable'
         tile.icon = icon
@@ -1249,12 +1251,12 @@ const MoveUnits = {
         const next = path[0]
         const nextId = `${next.q},${next.r}`
         const nextTile = tiles[nextId]
-        if (nextTile && nextTile.ruin) continue
         unit.prevHexId = unit.hexId
         unit.hexId = nextId
 
+        // 废墟不触发占领（归属固定为摧毁方）
         const tile = tiles[unit.hexId]
-        if (tile && tile.owner && tile.owner !== unit.owner) {
+        if (tile && tile.owner && tile.owner !== unit.owner && !tile.ruin) {
           TerritorySystem.claim(unit.hexId, unit.owner, tiles, SeededRNG)
         }
       }
@@ -1570,10 +1572,12 @@ const AI_HQ = { q: 4, r: 1, owner: 'ai' }
 function initGameState() {
   SeededRNG.init(42)
 
+  // 开局双方各占一半：r=0~5 归 AI（红），r=6~11 归玩家（绿）
   const tiles = {}
   for (let r = 0; r < HexGrid.ROWS; r++) {
     for (let q = 0; q < HexGrid.COLS; q++) {
-      tiles[`${q},${r}`] = { q, r, owner: null, state: 'inactive' }
+      const owner = r < HexGrid.ROWS / 2 ? 'ai' : 'player'
+      tiles[`${q},${r}`] = { q, r, owner, state: 'inactive' }
     }
   }
 
@@ -1585,6 +1589,7 @@ function initGameState() {
   tiles[aiHqId] = { q: AI_HQ.q, r: AI_HQ.r, owner: 'ai', state: 'opened',
     building: { type: 'hq', hp: hqSpec.hp, maxHp: hqSpec.hp } }
 
+  // HQ 周围 6 格设为中立 openable（先到先得）
   OpeningLayout.generateOpening(PLAYER_HQ, tiles, SeededRNG)
   OpeningLayout.generateOpening(AI_HQ, tiles, SeededRNG)
 
@@ -1596,11 +1601,12 @@ function initGameState() {
   VictorySystem.init()
   AIBehavior.init()
 
-  // 开局只有两个 HQ 格登记进 TerritorySystem
-  TerritorySystem.owners[playerHqId] = 'player'
-  TerritorySystem.owners[aiHqId] = 'ai'
+  // 全图登记领地归属（含 inactive）
+  for (const hexId of Object.keys(tiles)) {
+    if (tiles[hexId].owner) TerritorySystem.owners[hexId] = tiles[hexId].owner
+  }
 
-  // 激活与 HQ 相邻的格子为 openable
+  // 激活与己方 opened/openable 相邻的 inactive 格子
   TileSystem.activateOpenableTiles(tiles, SeededRNG)
 
   return { tiles }
@@ -1657,13 +1663,14 @@ const OWNER_UNIT_COLOR = {
 }
 
 // 鲜亮风格格子配色（己方绿 / 敌方红 / 中立灰 / 废墟褐）
+// inactive 格子使用与 opened 相同颜色（纯领地色，无图标）
 const TILE_COLORS = {
   playerOpened:   '#7ec850',
   playerOpenable: '#7ec850',
-  playerInactive: '#2a5a2a',
+  playerInactive: '#7ec850',
   aiOpened:       '#e85545',
   aiOpenable:     '#e85545',
-  aiInactive:     '#5a2a2a',
+  aiInactive:     '#e85545',
   neutral:        '#888898',
   ruin:           '#3a2a1a'
 }
@@ -1672,10 +1679,10 @@ const TILE_COLORS = {
 const TILE_STROKES = {
   playerOpened:   '#5aa838',
   playerOpenable: '#5aa838',
-  playerInactive: '#1d401d',
+  playerInactive: '#5aa838',
   aiOpened:       '#c43a2e',
   aiOpenable:     '#c43a2e',
-  aiInactive:     '#401d1d',
+  aiInactive:     '#c43a2e',
   neutral:        '#666678',
   ruin:           '#281c10'
 }
@@ -2604,14 +2611,14 @@ render()
   }
   const testTiles = {
     '4,11': { q: 4, r: 11, owner: 'player', state: 'opened' },
-    '3,11': { q: 3, r: 11, owner: null, state: 'inactive' },
+    '3,11': { q: 3, r: 11, owner: 'player', state: 'inactive' },
     '0,0': { q: 0, r: 0, owner: null, state: 'inactive' }
   }
   const activated = TileSystem.activateOpenableTiles(testTiles, mockRng)
   console.assert(testTiles['3,11'].state === 'openable',
-    '相邻己方领地的 inactive 格应变为 openable')
+    '相邻己方 opened 的 inactive 格应变为 openable')
   console.assert(testTiles['0,0'].state === 'inactive',
-    '不相邻己方领地的 inactive 格应保持 inactive')
+    '无 owner 的 inactive 格应保持 inactive')
 
   SeededRNG.init(42)
   const result = TileSystem.assignTileRng(SeededRNG)
@@ -3081,12 +3088,10 @@ render()
     const tile = gs.tiles[hexId]
     if (tile && tile.building && tile.building.type === 'barracks') {
       barracksCount++
-      console.assert(BarracksSystem.timers[hexId] !== undefined,
-        `开局兵营 ${hexId} 应已在 BarracksSystem.timers 中注册`)
     }
   }
-  console.assert(barracksCount > 0,
-    `开局应有兵营格子，实际 ${barracksCount}`)
+  console.assert(barracksCount === 0,
+    `开局不应有兵营格子（HQ 周围 6 格为 openable，需玩家手动开启），实际 ${barracksCount}`)
 
   // 8. removeBarracks 停止计时
   BarracksSystem.init()
@@ -3266,7 +3271,7 @@ render()
   const neighbors = HexGrid.getNeighbors(4, 5)
   for (const n of neighbors) {
     const key = `${n.q},${n.r}`
-    if (!t7[key]) t7[key] = { q: n.q, r: n.r, owner: null, state: 'inactive' }
+    if (!t7[key]) t7[key] = { q: n.q, r: n.r, owner: 'player', state: 'inactive' }
   }
   SeededRNG.init(99)
   const beforeOpenable = Object.values(t7).filter(t => t && t.state === 'openable').length
@@ -4002,6 +4007,7 @@ render()
 
   // === 6. 平局按玩家胜 ===
   VictorySystem.init()
+  ResourceSystem.init()
   const t6 = freshTiles()
   TerritorySystem.init()
   TerritorySystem.claim('4,10', 'player', t6, SeededRNG)
