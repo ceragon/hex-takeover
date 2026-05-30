@@ -134,9 +134,11 @@ const HexGrid = {
   // 返回 (q, r) 的 6 个邻居，过滤掉越界格；输入若越界返回 []
   getNeighbors(q, r) {
     if (!this.isInBounds(q, r)) return []
+    // odd-r offset：偶数行不移、奇数行右移半格（与 axialToPixel 对齐）。
+    // 上下对角邻居的 q 偏移随行奇偶翻转——偶数行偏左 (-1)，奇数行偏右 (+1)。
     const offsets = (r % 2 === 0)
-      ? [[1, 0], [-1, 0], [0, -1], [-1, -1], [1, 1], [0, 1]]
-      : [[1, 0], [-1, 0], [1, -1], [0, -1], [0, 1], [-1, 1]]
+      ? [[1, 0], [-1, 0], [0, -1], [-1, -1], [-1, 1], [0, 1]]
+      : [[1, 0], [-1, 0], [1, -1], [0, -1], [0, 1], [1, 1]]
     const result = []
     for (const [dq, dr] of offsets) {
       const nq = q + dq
@@ -200,6 +202,24 @@ const SeededRNG = {
       ;[result[i], result[j]] = [result[j], result[i]]
     }
     return result
+  },
+
+  // 独立 RNG 流：不污染全局单例 _state（AI 噪声需独立种子，否则
+  // 第一次决策的 init 会 reseed 全局，扰动地块生成/战斗/混合池抽样）
+  createStream(seed) {
+    let state = seed | 0
+    if (state === 0) state = 1
+    const next = () => {
+      let t = state += 0x6D2B79F5
+      t = Math.imul(t ^ (t >>> 15), t | 1)
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+    }
+    return {
+      next,
+      nextFloat: next,
+      nextInt: (min, max) => Math.floor(next() * (max - min + 1)) + min
+    }
   }
 }
 
@@ -275,21 +295,17 @@ const TileSystem = {
     throw new Error(`TileSystem.open: unknown icon "${icon}"`)
   },
 
-  activateOpenableTiles(tiles, rng) {
-    // 先收集候选格（基于调用前的状态快照），再统一激活，防止级联
+  activateOpenableTiles(tiles, origin, rng) {
+    // 只激活已开格 origin 的直接 inactive 邻居（owner=null 或己方），
+    // openable 格子本身不作为激活源。
+    if (!origin || origin.state !== 'opened') return []
     const candidates = []
-    for (const hexId of Object.keys(tiles)) {
-      const tile = tiles[hexId]
-      if (!tile) continue
-      if (tile.state !== 'inactive') continue
-      if (!tile.owner) continue
-      const neighbors = HexGrid.getNeighbors(tile.q, tile.r)
-      const adjToOwnActive = neighbors.some(n => {
-        const nt = tiles[`${n.q},${n.r}`]
-        return nt && nt.owner && nt.owner === tile.owner
-          && (nt.state === 'opened' || nt.state === 'openable')
-      })
-      if (adjToOwnActive) candidates.push(tile)
+    for (const n of HexGrid.getNeighbors(origin.q, origin.r)) {
+      const nt = tiles[`${n.q},${n.r}`]
+      if (!nt) continue
+      if (nt.state !== 'inactive') continue
+      if (nt.owner !== null && nt.owner !== origin.owner) continue
+      candidates.push(nt)
     }
     const activated = []
     for (const tile of candidates) {
@@ -537,7 +553,7 @@ const TerritorySystem = {
     this.owners = {}
   },
 
-  claim(hexId, owner, tiles, rng) {
+  claim(hexId, owner, tiles) {
     this.owners[hexId] = owner
     if (tiles) {
       const tile = tiles[hexId]
@@ -545,7 +561,6 @@ const TerritorySystem = {
         tile.owner = owner
         tile.flashTicks = 3
       }
-      if (rng) TileSystem.activateOpenableTiles(tiles, rng)
     }
   },
 
@@ -671,18 +686,15 @@ const UpgradeSystem = {
 // ============================================================
 const VictorySystem = {
   INITIAL_COUNTDOWN: 180,
-  INITIAL_HQ_HP: 1000,
   WAVE_TICKS: 5,
   WAVE_RADIUS_STEP: 3.0,
 
   countdown: 180,
-  hqHp: { player: 1000, ai: 1000 },
   gameOver: null,
   wave: null,
 
   init() {
     this.countdown = this.INITIAL_COUNTDOWN
-    this.hqHp = { player: this.INITIAL_HQ_HP, ai: this.INITIAL_HQ_HP }
     this.destroyedBuildings = { player: 0, ai: 0 }
     this.gameOver = null
     this.wave = null
@@ -690,19 +702,6 @@ const VictorySystem = {
 
   isGameOver() {
     return this.gameOver !== null
-  },
-
-  _checkHqDestroyed(tiles) {
-    for (const side of ['player', 'ai']) {
-      if (this.hqHp[side] <= 0 && !(this.gameOver || this.wave)) {
-        const winner = side === 'player' ? 'ai' : 'player'
-        const hqHexId = side === 'player'
-          ? `${PLAYER_HQ.q},${PLAYER_HQ.r}`
-          : `${AI_HQ.q},${AI_HQ.r}`
-        this.startWave(winner, hqHexId, tiles)
-        return
-      }
-    }
   },
 
   startWave(winner, loserHqHexId, tiles) {
@@ -718,12 +717,6 @@ const VictorySystem = {
       flipped: {}
     }
     this.gameOver = { winner, reason: 'hq_destroyed' }
-  },
-
-  damageHq(side, amount, tiles) {
-    if (this.gameOver) return
-    this.hqHp[side] = Math.max(0, this.hqHp[side] - amount)
-    this._checkHqDestroyed(tiles)
   },
 
   _onCountdownExpired(tiles) {
@@ -818,8 +811,6 @@ const VictorySystem = {
     }
     if (this.gameOver) return
     this.countdown = Math.max(0, this.countdown - 0.1)
-    this._checkHqDestroyed(tiles)
-    if (this.gameOver) return
     if (this.countdown <= 0.001) {
       this._onCountdownExpired(tiles)
     }
@@ -1020,7 +1011,7 @@ const CombatSystem = {
         if (isHq && typeof VictorySystem !== 'undefined') {
           VictorySystem.startWave(attacker, hexId, tiles)
         } else {
-          TerritorySystem.claim(hexId, attacker, tiles, SeededRNG)
+          TerritorySystem.claim(hexId, attacker, tiles)
         }
       }
     }
@@ -1260,7 +1251,7 @@ const MoveUnits = {
         // 废墟不触发占领（归属固定为摧毁方）
         const tile = tiles[unit.hexId]
         if (tile && tile.owner && tile.owner !== unit.owner && !tile.ruin) {
-          TerritorySystem.claim(unit.hexId, unit.owner, tiles, SeededRNG)
+          TerritorySystem.claim(unit.hexId, unit.owner, tiles)
         }
       }
     }
@@ -1320,7 +1311,7 @@ const ClickHandler = {
       tile.building = { type: 'gold_mine', hp: spec.hp, maxHp: spec.hp, level: 0 }
     }
 
-    TileSystem.activateOpenableTiles(tiles, SeededRNG)
+    TileSystem.activateOpenableTiles(tiles, tile, SeededRNG)
 
     return { ok: true, result }
   }
@@ -1363,7 +1354,7 @@ const AIBehavior = {
         this.executeAction(action, tiles, rng)
       }
     } else if (this._tickCounter >= this._decisionTick) {
-      if (!this._rng) this._rng = SeededRNG.init(12345)
+      if (!this._rng) this._rng = SeededRNG.createStream(12345)
       const actions = this.enumerateActions(tiles)
       const action = this.selectAction(actions, this._rng, tiles)
       this._pendingAction = {
@@ -1405,16 +1396,71 @@ const AIBehavior = {
     return false
   },
 
+  // 统计 AI 当前产兵源数量（兵营/兵种卡），用于「建军需求」加权
+  _countArmySources(tiles) {
+    let n = 0
+    for (const hexId of Object.keys(tiles)) {
+      const t = tiles[hexId]
+      if (t && t.owner === this.SIDE && t.building && t.building.type === 'barracks') n++
+    }
+    return n
+  },
+
+  // 评估某格离「被威胁前线」的近度：返回 0..1（越靠近敌方单位/越靠近己方 HQ 越高）
+  // 用于把建军/防御动作引导到受威胁的一侧
+  _threatProximity(tile) {
+    const hqDist = VictorySystem._hexDist(`${tile.q},${tile.r}`, `${AI_HQ.q},${AI_HQ.r}`)
+    let prox = 0
+    const units = BarracksSystem.units || []
+    let nearest = Infinity
+    for (const u of units) {
+      if (u.owner === this.SIDE) continue
+      const d = VictorySystem._hexDist(`${tile.q},${tile.r}`, u.hexId)
+      if (d < nearest) nearest = d
+    }
+    if (nearest < Infinity) {
+      // 敌方单位距离 0→1.0，距离 6+→0
+      prox = Math.max(prox, Math.max(0, 1 - nearest / 6))
+    }
+    // 靠近己方 HQ 的格子天然更需要防御
+    prox = Math.max(prox, Math.max(0, 1 - hqDist / 8) * 0.6)
+    return prox
+  },
+
+  // 全局威胁等级：靠近 AI HQ / AI 领地的敌方单位数（决定整体「该建军了」的紧迫度）
+  _threatLevel(tiles) {
+    const units = BarracksSystem.units || []
+    let threat = 0
+    for (const u of units) {
+      if (u.owner === this.SIDE) continue
+      const d = VictorySystem._hexDist(u.hexId, `${AI_HQ.q},${AI_HQ.r}`)
+      if (d <= 5) threat += (1 - d / 5)
+    }
+    return threat
+  },
+
   scoreAction(action, tiles) {
     if (action.type === 'wait') return 0
     let score = 0
     if (action.type === 'open_tile') {
       const { tile } = action
+      const armySources = this._countArmySources(tiles)
+      const threat = this._threatLevel(tiles)
+      // 建军需求：产兵源越少越想补；有威胁时更急
+      const armyNeed = Math.max(0, 4 - armySources)
       if (tile.icon === 'metal') score += 25
-      else if (tile.icon === 'shield') score += 12
-      else if (tile.icon === '?') {
-        score += (tile.price >= 100 ? 12 : tile.price >= 50 ? 8 : 4)
-      } else if (tile.icon === 'helmet') score += 6
+      else if (tile.icon === 'shield') {
+        // 防御：基础值 + 受威胁前线显著加权
+        score += 14
+      } else if (tile.icon === '?') {
+        // 兵营槽：可能开空（25 金档 50%），基础略低于头盔；价高更稳
+        score += (tile.price >= 100 ? 16 : tile.price >= 50 ? 11 : 5)
+        score += armyNeed * 1.5
+      } else if (tile.icon === 'helmet') {
+        // 头盔：必出兵种，是建军主力，给足权重
+        score += (tile.price >= 100 ? 22 : tile.price >= 50 ? 18 : 13)
+        score += armyNeed * 2.5
+      }
       const neighbors = HexGrid.getNeighbors(tile.q, tile.r)
       let enemyAdj = 0
       for (const n of neighbors) {
@@ -1423,6 +1469,12 @@ const AIBehavior = {
       }
       if (tile.icon === 'shield') score += enemyAdj * 3
       score += enemyAdj * 1.5
+      // 威胁反应：受威胁时把建军/防御动作推向受威胁前线
+      if (threat > 0 && (tile.icon === 'shield' || tile.icon === 'helmet' || tile.icon === '?')) {
+        const prox = this._threatProximity(tile)
+        const reactWeight = tile.icon === 'shield' ? 10 : 8
+        score += threat * prox * reactWeight
+      }
       if (ResourceSystem.gold[this.SIDE] >= action.cost) score += 5
     } else if (action.type === 'upgrade') {
       const { tile } = action
@@ -1486,7 +1538,7 @@ const AIBehavior = {
       delete tile.icon
       delete tile.price
       this._applyOpenResult(tile, result)
-      TileSystem.activateOpenableTiles(tiles, rng)
+      TileSystem.activateOpenableTiles(tiles, tile, rng)
     } else if (action.type === 'upgrade') {
       UpgradeSystem.upgrade(action.tile, this.SIDE)
     }
@@ -1919,8 +1971,9 @@ function renderGrid() {
       }
 
       // HQ 专属：大号 HP 条显示在格子上方（颜色随血量变化：绿→黄→红）
+      // HP 以 tile.building.hp 为唯一真相（战斗直接打这个值）
       if (tile.building && tile.building.type === 'hq') {
-        const hpRatio = Math.max(0, (VictorySystem.hqHp[tile.owner] || 0) / VictorySystem.INITIAL_HQ_HP)
+        const hpRatio = Math.max(0, tile.building.hp / tile.building.maxHp)
         const barW = size * 1.6
         const barH = 6
         const bx = cx - barW / 2
@@ -1929,7 +1982,7 @@ function renderGrid() {
         ctx.fillRect(bx, by, barW, barH)
         ctx.fillStyle = hpColor(hpRatio)
         ctx.fillRect(bx, by, barW * hpRatio, barH)
-        drawHexLabel(cx, by - 5, `${Math.ceil(VictorySystem.hqHp[tile.owner] || 0)}`, 10, '#fff')
+        drawHexLabel(cx, by - 5, `${Math.ceil(tile.building.hp)}`, 10, '#fff')
       } else if (tile.building && tile.building.hp !== undefined && tile.building.maxHp) {
         // 普通建筑 HP 条（颜色随血量变化）
         const hpRatio = Math.max(0, tile.building.hp / tile.building.maxHp)
@@ -2513,11 +2566,11 @@ render()
   console.assert(p00.x === 0 && p00.y === 0, 'axialToPixel(0,0) 应为 (0,0)')
 
   const corner = HexGrid.getNeighbors(0, 0)
-  console.assert(corner.length === 3, `角落 (0,0) 应有 3 个邻居，实际 ${corner.length}`)
+  console.assert(corner.length === 2, `角落 (0,0) 应有 2 个邻居，实际 ${corner.length}`)
   console.assert(corner.every(n => HexGrid.isInBounds(n.q, n.r)), '角落邻居不应越界')
 
   const edge = HexGrid.getNeighbors(0, 3)
-  console.assert(edge.length === 4, `左边缘 (0,3) 应有 4 个邻居，实际 ${edge.length}`)
+  console.assert(edge.length === 5, `左边缘 (0,3) 应有 5 个邻居，实际 ${edge.length}`)
 
   const mid = HexGrid.getNeighbors(4, 3)
   console.assert(mid.length === 6, `中央 (4,3) 应有 6 个邻居，实际 ${mid.length}`)
@@ -2525,6 +2578,37 @@ render()
   const cornerTopRight = HexGrid.getNeighbors(8, 0)
   console.assert(cornerTopRight.every(n => n.q <= 8 && n.r >= 0),
     '右上角落邻居不应越界')
+
+  // 邻接对称性：B 是 A 的邻居 ⟺ A 是 B 的邻居（odd-r offset 表写反曾违反 176 处）
+  let symFail = 0
+  for (let r = 0; r < HexGrid.ROWS; r++) {
+    for (let q = 0; q < HexGrid.COLS; q++) {
+      for (const n of HexGrid.getNeighbors(q, r)) {
+        if (!HexGrid.getNeighbors(n.q, n.r).some(b => b.q === q && b.r === r)) symFail++
+      }
+    }
+  }
+  console.assert(symFail === 0, `邻接关系应对称，违反 ${symFail} 处`)
+
+  // 几何一致性：邻居恰好是 axialToPixel 中心距离 == hexW 的格子（即视觉相邻）
+  const hexW = Math.sqrt(3) * HexGrid.hexSize
+  let geoFail = 0
+  for (let r = 0; r < HexGrid.ROWS; r++) {
+    for (let q = 0; q < HexGrid.COLS; q++) {
+      const got = HexGrid.getNeighbors(q, r).map(n => `${n.q},${n.r}`).sort().join('|')
+      const c = HexGrid.axialToPixel(q, r)
+      const truth = []
+      for (let rr = 0; rr < HexGrid.ROWS; rr++) {
+        for (let qq = 0; qq < HexGrid.COLS; qq++) {
+          if (qq === q && rr === r) continue
+          const p = HexGrid.axialToPixel(qq, rr)
+          if (Math.abs(Math.hypot(p.x - c.x, p.y - c.y) - hexW) < 1e-6) truth.push(`${qq},${rr}`)
+        }
+      }
+      if (got !== truth.sort().join('|')) geoFail++
+    }
+  }
+  console.assert(geoFail === 0, `邻居应与像素相邻格一致，不符 ${geoFail} 格`)
 
   for (let r = 0; r < 12; r++) {
     for (let q = 0; q < 9; q++) {
@@ -2618,11 +2702,35 @@ render()
     '3,11': { q: 3, r: 11, owner: 'player', state: 'inactive' },
     '0,0': { q: 0, r: 0, owner: null, state: 'inactive' }
   }
-  const activated = TileSystem.activateOpenableTiles(testTiles, mockRng)
+  TileSystem.activateOpenableTiles(testTiles, testTiles['4,11'], mockRng)
   console.assert(testTiles['3,11'].state === 'openable',
-    '相邻己方 opened 的 inactive 格应变为 openable')
+    '刚开格的己方 inactive 邻居应变为 openable')
   console.assert(testTiles['0,0'].state === 'inactive',
-    '无 owner 的 inactive 格应保持 inactive')
+    '非邻居的 inactive 格应保持 inactive')
+
+  // 回归：玩家开格不得激活敌方 owner 的相邻 inactive 格（曾导致跨阵营蔓延）
+  const crossTiles = {
+    '4,5': { q: 4, r: 5, owner: 'player', state: 'opened' },
+    '4,6': { q: 4, r: 6, owner: 'player', state: 'inactive' },
+    '5,5': { q: 5, r: 5, owner: 'ai', state: 'inactive' }
+  }
+  TileSystem.activateOpenableTiles(crossTiles, crossTiles['4,5'], mockRng)
+  console.assert(crossTiles['4,6'].state === 'openable',
+    '己方相邻 inactive 应激活')
+  console.assert(crossTiles['5,5'].state === 'inactive',
+    '敌方 owner 的相邻 inactive 不应被激活（跨阵营蔓延回归）')
+
+  // 回归：openable 格子不作为激活源，开格只新增 origin 的直接邻居（≤6）
+  const noCascade = {
+    '4,5': { q: 4, r: 5, owner: 'player', state: 'opened' },
+    '5,5': { q: 5, r: 5, owner: 'player', state: 'openable', icon: '?', price: 25 },
+    '6,5': { q: 6, r: 5, owner: 'player', state: 'inactive' }
+  }
+  const nc = TileSystem.activateOpenableTiles(noCascade, noCascade['4,5'], mockRng)
+  console.assert(noCascade['6,5'].state === 'inactive',
+    'openable 格子不应作为激活源传染更远的 inactive 格（级联回归）')
+  console.assert(nc.length <= 6,
+    `单次激活数不应超过 origin 的 6 个邻居，实际 ${nc.length}`)
 
   SeededRNG.init(42)
   const result = TileSystem.assignTileRng(SeededRNG)
@@ -2671,7 +2779,7 @@ render()
     '3,11': { q: 3, r: 11, owner: null, state: 'openable', icon: '?', price: 25 },
     '5,11': { q: 5, r: 11, owner: null, state: 'opened', building: { type: 'barracks' } }
   }
-  TileSystem.activateOpenableTiles(testTiles2, mockRng)
+  TileSystem.activateOpenableTiles(testTiles2, testTiles2['4,11'], mockRng)
   console.assert(testTiles2['3,11'].icon === '?',
     '已 openable 的格子不应被重新分配')
   console.assert(testTiles2['5,11'].building.type === 'barracks',
@@ -3376,7 +3484,7 @@ render()
   console.assert(TerritorySystem.total === HexGrid.COLS * HexGrid.ROWS,
     `total should be ${HexGrid.COLS * HexGrid.ROWS}, got ${TerritorySystem.total}`)
 
-  // 6. cascade: claiming near owned tile activates inactive neighbors
+  // 6. claim does NOT activate openable tiles (only opened tiles do)
   TerritorySystem.init()
   SeededRNG.init(42)
   const tiles = {}
@@ -3390,8 +3498,8 @@ render()
   const beforeCount = Object.values(tiles).filter(t => t && t.state === 'openable').length
   TerritorySystem.claim('4,4', 'player', tiles, SeededRNG)
   const afterCount = Object.values(tiles).filter(t => t && t.state === 'openable').length
-  console.assert(afterCount > beforeCount,
-    `cascade should activate new tiles: ${beforeCount} → ${afterCount}`)
+  console.assert(afterCount === beforeCount,
+    `claim should NOT activate new openable tiles: before=${beforeCount}, after=${afterCount}`)
 
   console.log('[test] TerritorySystem tests passed')
 })()
@@ -3963,8 +4071,6 @@ render()
   // === 1. init 状态 ===
   VictorySystem.init()
   console.assert(VictorySystem.countdown === 180, `init countdown=180, got ${VictorySystem.countdown}`)
-  console.assert(VictorySystem.hqHp.player === 1000 && VictorySystem.hqHp.ai === 1000,
-    'init HQ HP 1000/1000')
   console.assert(VictorySystem.isGameOver() === false, 'init not game over')
   console.assert(VictorySystem.wave === null, 'init wave null')
 
@@ -4020,11 +4126,15 @@ render()
   console.assert(VictorySystem.gameOver.winner === 'player',
     `tie goes to player, got ${VictorySystem.gameOver.winner}`)
 
-  // === 7. HQ HP 归零 → 波浪启动 + gameOver (hq_destroyed) ===
+  // === 7. AI HQ HP 归零（战斗路径）→ 波浪启动 + gameOver (hq_destroyed) ===
+  // HQ HP 以 tile.building.hp 为唯一真相；摧毁经 CombatSystem._cleanup → startWave
   VictorySystem.init()
+  TerritorySystem.init()
   const t7 = freshTiles()
-  VictorySystem.damageHq('ai', 1000, t7)
-  console.assert(VictorySystem.hqHp.ai === 0, 'ai HQ HP = 0')
+  const aiHq7 = `${AI_HQ.q},${AI_HQ.r}`
+  t7[aiHq7] = { q: AI_HQ.q, r: AI_HQ.r, owner: 'ai', state: 'opened',
+    building: { type: 'hq', hp: 0, maxHp: 1000 }, lastAttacker: 'player' }
+  CombatSystem._cleanup([], t7)
   console.assert(VictorySystem.isGameOver() === true, 'HQ destroy triggers game over')
   console.assert(VictorySystem.gameOver.reason === 'hq_destroyed',
     `reason=hq_destroyed, got ${VictorySystem.gameOver.reason}`)
@@ -4033,8 +4143,12 @@ render()
 
   // === 8. 己方 HQ 被摧毁 → AI 胜 ===
   VictorySystem.init()
+  TerritorySystem.init()
   const t8 = freshTiles()
-  VictorySystem.damageHq('player', 1000, t8)
+  const playerHq8 = `${PLAYER_HQ.q},${PLAYER_HQ.r}`
+  t8[playerHq8] = { q: PLAYER_HQ.q, r: PLAYER_HQ.r, owner: 'player', state: 'opened',
+    building: { type: 'hq', hp: 0, maxHp: 1000 }, lastAttacker: 'ai' }
+  CombatSystem._cleanup([], t8)
   console.assert(VictorySystem.gameOver.winner === 'ai',
     `ai wins on player HQ destroy, got ${VictorySystem.gameOver.winner}`)
 
@@ -4065,7 +4179,7 @@ render()
   TerritorySystem.claim('4,2', 'ai', t10, SeededRNG)
   TerritorySystem.claim('4,3', 'ai', t10, SeededRNG)
   TerritorySystem.claim('4,10', 'player', t10, SeededRNG)
-  VictorySystem.damageHq('ai', 1000, t10)
+  VictorySystem.startWave('player', `${AI_HQ.q},${AI_HQ.r}`, t10)
   const originalGameOver = VictorySystem.gameOver
   for (let i = 0; i < 2000; i++) VictorySystem.tick(t10)
   console.assert(VictorySystem.gameOver === originalGameOver,
@@ -4074,11 +4188,8 @@ render()
     'hq_destroyed reason preserved')
 
   // === 11. reset 重置所有状态 ===
-  VictorySystem.damageHq('ai', 500, t10)
   VictorySystem.reset()
   console.assert(VictorySystem.countdown === 180, 'reset countdown=180')
-  console.assert(VictorySystem.hqHp.player === 1000 && VictorySystem.hqHp.ai === 1000,
-    'reset HQ HP')
   console.assert(VictorySystem.isGameOver() === false, 'reset clears game over')
   console.assert(VictorySystem.wave === null, 'reset clears wave')
 

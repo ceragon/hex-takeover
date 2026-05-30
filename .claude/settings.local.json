@@ -19,7 +19,19 @@
       "Bash(kill %1)",
       "Bash(curl *)",
       "Bash(python3 -m http.server 8080)",
-      "Bash(mktemp *)"
+      "Bash(mktemp *)",
+      "Bash(awk *)",
+      "Read(//Users/happyelements/.nvm/versions/node/**)",
+      "Bash(npm ls *)",
+      "Bash(lsof -nP -iTCP:8137 -sTCP:LISTEN)",
+      "Bash(lsof -nP -iTCP:8080 -sTCP:LISTEN)",
+      "Read(//private/tmp/**)",
+      "Bash(git -C /Users/happyelements/air/hex-takeover status --short)",
+      "Skill(grill-with-docs)",
+      "Bash(npx playwright *)",
+      "Bash(ps -p 24056 -o command=)",
+      "Bash(break)",
+      "Bash(pkill -f \"http.server 8090\")"
     ]
   }
 }
