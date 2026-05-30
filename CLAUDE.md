@@ -21,8 +21,8 @@ The domain glossary lives in `CONTEXT.md`.
 
 - `AGENTS.md` — 必读
 - `CONTEXT.md` — 涉及领域词汇时必读
-- `doc/design/v2-prd.md` — 涉及新模块设计时按需读
-- `doc/research/gameplay-v2.md` — 涉及数值与机制调研时按需读
+- `docs/design/v2-prd.md` — 涉及新模块设计时按需读
+- `docs/research/gameplay-v2.md` — 涉及数值与机制调研时按需读
 - `docs/adr/0001-v2-architecture-pivot.md` — 涉及 v2 架构决策时按需读
 
 ## Do NOT

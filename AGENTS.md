@@ -6,9 +6,9 @@ This file provides guidance to the AI agent when working with code in this repos
 
 **占城大师 (Hex Takeover)** — Single-file HTML game (MuleRun format) with hex-map tile revealing, resource management, barracks, auto-combat, and AI opponent. Zero dependencies, all CSS/JS inline in one `index.html`.
 
-Deadline: 2026-06-22. Branch from `doc/PRD.md` and `CONTEXT.md`.
+Deadline: 2026-06-22. Branch from `docs/PRD.md` and `CONTEXT.md`.
 
-**Current status: v2 rewrite in progress.** v2 完全取代 v1（不保留 reveal 翻格子机制和三角克制）。完整 v2 领域词汇见 `CONTEXT.md`，机制调研见 `doc/research/gameplay-v2.md`。
+**Current status: v2 rewrite in progress.** v2 完全取代 v1（不保留 reveal 翻格子机制和三角克制）。完整 v2 领域词汇见 `CONTEXT.md`，机制调研见 `docs/research/gameplay-v2.md`。
 
 ## Key Decisions
 
@@ -42,9 +42,12 @@ v2 是"保留骨架、换内脏"的中等规模重构：Canvas 渲染、HexGrid 
 | **新增** `RuinSystem` | 建筑被摧毁 → 废墟 | 小 |
 | **新增** `DeathEffect` | 单位死亡粒子特效 | 中 |
 
-**开发方式：垂直切片迭代**，5 个切片，每个切片保持"游戏能跑起来"的状态（详见 `doc/design/`）。
+**开发方式：垂直切片迭代**，5 个切片，每个切片保持"游戏能跑起来"的状态（详见 `docs/design/`）。
 
-## Module Architecture
+## Module Architecture (v1 历史快照 · 已废弃)
+
+> ⚠️ **下表是 v1 的模块/行号/机制，已不反映 v2 代码**（v2 无 `TileReveal`、无 `MAP_COLS=5`、无步骑弓克制链）。
+> v2 模块对应见上方「v2 Rewrite Strategy」表，v2 关键数值见下方「v2 Core Numbers」表。保留此表仅供对照 v1→v2 演进，**勿据此定位 v2 代码**。
 
 | Module | Line | Responsibility |
 |--------|------|----------------|
@@ -71,7 +74,7 @@ Tests are embedded at the bottom (lines ~960-1365): `testHexGrid`, `testTileReve
 
 ## v2 Core Numbers (Quick Reference)
 
-完整数值见 `doc/research/gameplay-v2.md` → "数值建议"。以下是开发期最常查的常量：
+完整数值见 `docs/research/gameplay-v2.md` → "数值建议"。以下是开发期最常查的常量：
 
 | 类别 | 值 |
 |------|---|
@@ -151,10 +154,10 @@ initGameState() → main loop → UI/render → click handling → tests
 
 ## Core Numbers
 
-Refer to `doc/PRD.md` → "核心数值" section for all balance values. Quick reference in `CONTEXT.md`.
+Refer to `docs/PRD.md` → "核心数值" section for all balance values. Quick reference in `CONTEXT.md`.
 
 ## Out of Scope
 
-Card collection/upgrades, multi-faction, unit merge/star, real-time PvP, audio/BGM. See `doc/PRD.md` → "Out of Scope".
+Card collection/upgrades, multi-faction, unit merge/star, real-time PvP, audio/BGM. See `docs/PRD.md` → "Out of Scope".
 
 > ⚠️ **"mobile adaptation" 已移出 Out of Scope（2026-05-29）**：竖屏移动端现为主交付形态，见 Key Decisions 与 `docs/adr/0002-portrait-mobile-ui.md`。

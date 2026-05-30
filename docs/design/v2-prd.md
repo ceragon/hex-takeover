@@ -1,6 +1,6 @@
 # PRD: 占城大师 v2 — 开地块与品阶压制
 
-> 本 PRD 取代 `doc/design/mvp-prd.md`（v1）。完整机制调研见 `doc/research/gameplay-v2.md`，架构决策见 `docs/adr/0001-v2-architecture-pivot.md`，领域词汇以 `CONTEXT.md` 为准。
+> 本 PRD 取代 `docs/design/mvp-prd.md`（v1）。完整机制调研见 `docs/research/gameplay-v2.md`，架构决策见 `docs/adr/0001-v2-architecture-pivot.md`，领域词汇以 `CONTEXT.md` 为准。
 
 ## Problem Statement
 
@@ -10,7 +10,7 @@ v1 的"迷雾翻牌 + 步骑弓三角克制"玩法存在三个设计瓶颈：（
 
 v2 用"开地块 + 品阶压制"替换 v1 的"翻牌 + 三角克制"：
 
-- **地图扩大到 9×12 + 湖水行**（约 100 格），提供真正的"前线 + 后方"空间感；
+- **地图扩大到 9×12 = 108 格**（无湖水，odd-r offset 矩形网格），开局双方各占一半（r=0~5 AI / r=6~11 玩家），提供"前线 + 后方"空间感；
 - **格子改为状态机**（未激活 → 可开 → 已开），让玩家持续有"可开地块"这一核心决策目标；
 - **开地块采用混合池 + 二次概率**：价格档位（25/50/100/250）决定成本，图标（? / 头盔 / 盾牌 / 金属）决定产出类别，档位 + 图标联合决定具体建筑；
 - **兵种改为 4 品阶 × 6 种**，不做类型克制，纯品阶压制 + 行为差异化（防守反击 / 越格打建筑 / AOE）；
@@ -20,7 +20,7 @@ v2 用"开地块 + 品阶压制"替换 v1 的"翻牌 + 三角克制"：
 
 ### 地图与开局
 
-1. 作为玩家，我想看到一张 9 列 × 12 行的六边形地图，中央有 1 行不可通行的湖水分割带，所以我能感受到"前线 + 后方"的空间层次。
+1. 作为玩家，我想看到一张 9 列 × 12 行（108 格、无湖水）的六边形地图，开局双方各占一半（AI 占 r=0~5、玩家占 r=6~11），所以我能感受到"前线 + 后方"的空间层次。
 2. 作为玩家，我想在游戏开始时看到我方的 HQ 和围绕 HQ 的 6 个已开建筑格（兵种/箭塔/金矿的随机组合），所以我能基于开局阵容规划早期策略。
 3. 作为玩家，我想在开局至少 70% 概率获得至少 1 个金矿，所以我不会因"完全没经济"的极端开局而瞬间陷入困境。
 4. 作为玩家，我想看到 AI 对手同样拥有 HQ + 6 个开局建筑，所以我能感受到对称的公平性。
@@ -114,7 +114,7 @@ v2 用"开地块 + 品阶压制"替换 v1 的"翻牌 + 三角克制"：
 
 | 模块 | 职责 | 接口 |
 |------|------|------|
-| **HexGrid** | 9×12 + 湖水行的六边形坐标数学、像素转换、点击拾取 | `axialToPixel(q, r)`, `pixelToAxial(x, y)`, `getNeighbors(q, r)`, `isLake(q, r)`, `findHexAt(x, y)` |
+| **HexGrid** | 9×12=108 格（无湖水）的六边形坐标数学、像素转换、点击拾取 | `axialToPixel(q, r)`, `pixelToAxial(x, y)`, `getNeighbors(q, r)`, `findHexAt(x, y)` |
 | **RNG** | Seeded 随机数生成，单例贯穿整个游戏 | `next()`, `nextFloat()`, `weightedPick(options, weights)` |
 | **TileSystem** | 格子状态机（未激活 → 可开 → 已开）、混合池分配、二次概率表、激活判定 | `activate(hexId)`、`open(hexId) → BuildingResult`、`onTerritoryChanged()` |
 | **UnitTypes** | 6 兵种 × 4 品阶的纯数据表（HP/ATK/移速/射程/CD/攻击方式） | `getUnitSpec(tier, kind)`, `getAttackMode(tier, kind)` |
@@ -125,7 +125,7 @@ v2 用"开地块 + 品阶压制"替换 v1 的"翻牌 + 三角克制"：
 | **CombatSystem** | 单位交战 + 建筑受击 + 品阶压制 + 远程/近战切换 + AOE + 死亡特效触发 | `tick()` → resolve all combats, emit death events |
 | **TerritorySystem** | 格子归属、推线连锁、建筑摧毁连锁 | `claim(hexId, player)`, `onBuildingDestroyed(hexId)`, `countTerritory(player)` |
 | **RuinSystem** | 废墟生命周期（建筑摧毁 → 废墟格，不可重建不可通行） | `createRuin(hexId)`, `isRuin(hexId)` |
-| **VictorySystem** | HQ 血量追踪 + 3:00 倒计时 + 双重胜负判定（HQ 摧毁直胜 / 倒计时比格数） | `tick(dt)`, `onHQDamaged(player, amount)`, `checkVictory() → GameResult` |
+| **VictorySystem** | HQ 血量（存于建筑 `tile.building.hp`）+ 3:00 倒计时 + 胜负判定：**核心 HQ 摧毁直胜**，倒计时比格数为兜底（见 ADR-0002） | `tick(dt)`, `checkVictory() → GameResult` |
 | **UpgradeSystem** | 金矿/箭塔三档升级（成本、属性提升） | `tryUpgrade(hexId, player) → bool` |
 | **AIBehavior** | 评分-选择算法、难度参数化、合法动作枚举、启发式打分 | `tick(gameState, difficulty) → Action[]` |
 | **OpeningLayout** | 开局 HQ 周围 6 格随机填入建筑（≥1 金矿概率 70%） | `generateOpening(rng) → HexState[]` |
@@ -140,17 +140,17 @@ v2 用"开地块 + 品阶压制"替换 v1 的"翻牌 + 三角克制"：
 - **渲染：** Canvas 2D（零依赖，单文件友好）
 - **游戏循环：** `requestAnimationFrame` + 固定时间步长（100ms/次，10Hz）
 - **状态管理：** 单一 `GameState` 对象，不可变更新
-- **六边形布局：** 平顶六边形（flat-top），axial coordinate (q, r)
+- **六边形布局：** 尖顶六边形（pointy-top），odd-r offset 布局（奇数行右移半格），用 offset coordinate (q, r) 表示
 - **随机数：** 单一 seeded RNG 实例贯穿所有随机源（混合池、档位、二次概率、开局），确保 replay 可复现
 - **交付：** MuleRun 单文件 HTML，所有资源内联
 
 ### 核心数值
 
-完整数值表见 `doc/research/gameplay-v2.md` → "数值建议"。以下是架构决策级的常量：
+完整数值表见 `docs/research/gameplay-v2.md` → "数值建议"。以下是架构决策级的常量：
 
 | 参数 | 值 |
 |------|---|
-| 地图 | 9 列 × 12 行 + 1 行湖水（约 100 格） |
+| 地图 | 9 列 × 12 行 = 108 格（无湖水） |
 | 开局金币 | 60 |
 | 开局建筑数 | HQ 周围 6 格（≥1 金矿概率 70%） |
 | 对局时长 | 3:00 倒计时 |
@@ -200,7 +200,7 @@ v2 用"开地块 + 品阶压制"替换 v1 的"翻牌 + 三角克制"：
 **推线连锁**：
 1. `MoveUnits.tick` 让单位移动到新格子
 2. 若新格子是敌方颜色：`TerritorySystem.claim(hexId, player)` 变色
-3. 调用 `TileSystem.onTerritoryChanged()`：扫描所有未激活格子，若首次与己方领地相邻则激活（分配图标 + 价格）
+3. 触发**局部激活连锁**：仅以刚 claim 的格子为中心，激活其直接相邻的未激活格子（不再全图扫描）；只激活己方一侧、不跨阵营，已有的中立可开格保留。被激活的格子一次性分配图标 + 价格
 
 **建筑摧毁连锁**：
 1. `CombatSystem.tick` 检测到建筑 HP 归零
@@ -264,7 +264,7 @@ score(action, state):
 
 以下模块必须有独立的 `console.assert` IIFE 测试（沿用 v1 模式）：
 
-- **HexGrid**：axialToPixel/pixelToAxial 互逆、getNeighbors 边界、isLake 判定、findHexAt 命中精度
+- **HexGrid**：axialToPixel/pixelToAxial 互逆、getNeighbors 边界、findHexAt 命中精度
 - **RNG**：seeded 序列可复现、weightedPick 按权重分布（统计检验）
 - **TileSystem**：状态机单向转换、混合池分布符合权重、二次概率表正确、激活判定正确
 - **ResourceSystem**：addGold/trySpend 边界（负数、0、超出）、HQ+金矿 income tick
