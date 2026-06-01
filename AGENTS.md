@@ -40,7 +40,7 @@ v2 是"保留骨架、换内脏"的中等规模重构：Canvas 渲染、HexGrid 
 | **新增** `OpeningLayout` | 开局 HQ 周围 6 格随机填入建筑 | 小 |
 | **新增** `UpgradeSystem` | 金矿/箭塔三档升级 | 中 |
 | **新增** `RuinSystem` | 建筑被摧毁 → 废墟 | 小 |
-| **新增** `DeathEffect` | 单位死亡粒子特效 | 中 |
+| **新增** `Projectiles` | 箭塔/HQ 远程攻击弹道（视觉光点） | 小 |
 
 **开发方式：垂直切片迭代**，5 个切片，每个切片保持"游戏能跑起来"的状态（详见 `docs/design/`）。
 
@@ -82,7 +82,7 @@ Tests are embedded at the bottom (lines ~960-1365): `testHexGrid`, `testTileReve
 | 开局 | 60 金币，HQ 周围 6 格随机填入建筑 (≥1 金矿概率 70%) |
 | 对局时长 | 3:00 倒计时 |
 | HQ 血量 | 1000 HP |
-| HQ 攻击 | ATK ≈ 100 金箭塔，射程 6.0-7.0，产金 12g/6s |
+| HQ 攻击 | ATK ≈ 100 金箭塔，射程 3.0，产金 12g/6s |
 | 金矿产金 | 10g/6s |
 | 价格档位 | 25 / 50 / 100 / 250 金币 |
 | 混合池权重 | ? 55% / 头盔 25% / 盾牌 10% / 金属 10% |
@@ -109,7 +109,7 @@ This is a single file with no module system. **Definition order matters.** When 
 ```
 HexGrid → TileSystem → ResourceSystem → UnitTypes → BarracksSystem →
 CombatSystem → MoveUnits → VictorySystem → AIBehavior →
-OpeningLayout → UpgradeSystem → RuinSystem → DeathEffect →
+OpeningLayout → UpgradeSystem → RuinSystem → Projectiles →
 initGameState() → main loop → UI/render → click handling → tests
 ```
 
@@ -140,7 +140,7 @@ initGameState() → main loop → UI/render → click handling → tests
 
 <!-- Keep updated, max ~8-9 entries -->
 - **v2 getNeighbors odd-r 上下对角 q 偏移必须随行奇偶翻转：** 尖顶 odd-r（奇数行右移半格，与 `axialToPixel` 对齐），上/下对角邻居的 q 偏移**偶数行偏左 `-1`、奇数行偏右 `+1`**。曾把两个"下对角"写反 → 污染 99/108 格、破坏 176 处邻接对称性，表现为 HQ 周围某个 openable 格视觉上飘到一格半之外。**自验陷阱：用 `getNeighbors` 算邻居、再用 `getNeighbors` 判"是否相邻"会自洽通过、抓不到 bug**。必须用实现无关的标准：①对称性 `B∈N(A) ⟺ A∈N(B)`；②像素距离（真邻居 = `axialToPixel` 中心距恒为 `√3·hexSize`）。两条均已加入 `testHexGrid` 回归。
-- **HUD 必须在 renderGrid 之后画：** `renderGrid` 用 `ctx.fillRect(0,0,canvas.width,canvas.height)` 清整块画布。`renderTopBar`/`renderBottomBar`/`renderNotification`/覆盖层若在 renderGrid 之前画会被清掉。**render() 顺序固定为：grid → units → wave → death → topBar → bottomBar → notification → 覆盖层**。
+- **HUD 必须在 renderGrid 之后画：** `renderGrid` 用 `ctx.fillRect(0,0,canvas.width,canvas.height)` 清整块画布。`renderTopBar`/`renderBottomBar`/`renderNotification`/覆盖层若在 renderGrid 之前画会被清掉。**render() 顺序固定为：grid → units → wave → projectiles → topBar → bottomBar → notification → 覆盖层**。
 - **TerritorySystem.owners 开局必须登记已归属格：** `initGameState` 设 `tile.owner` 但不自动写 `TerritorySystem.owners`，导致 `count(owner)` 开局返回 0（地块数 HUD 显示 0/0）。**修复：generateOpening 后遍历 tiles，把有 owner 的格子写进 `TerritorySystem.owners`**。注意 `TerritorySystem.init()` 仍清空 owners（测试依赖），登记发生在 initGameState 而非 init。
 - **canvas 点击坐标必须做 letterbox 缩放补偿：** 画布逻辑尺寸 540×960 但 CSS 缩放后显示尺寸不同。点击事件给的是 CSS 像素，必须 `(clientX-rect.left) * canvas.width/rect.width` 换算到逻辑坐标，否则命中全偏。见 `toCanvasCoords`。
 - **v2 TerritorySystem.claim 只变色+闪白，不激活 openable：** `claim(hexId, owner, tiles)` 设 `tile.owner = owner` 和 `tile.flashTicks = 3`（领地变更闪白过渡）。**不再接受 rng 参数，不再调用 activateOpenableTiles**。只有 opened 格子（含 HQ）才能激活邻居。若测试只传空对象 `{}` 作为 tiles，`tiles[hexId]` 是 undefined，安全跳过；但生产代码总会传完整 tiles 字典。
@@ -152,6 +152,7 @@ initGameState() → main loop → UI/render → click handling → tests
 - **v2 AI 打分必须难度感知（normal vs hard 用不同公式）：** 升级打分若用单一公式（如金矿 base 30 / 箭塔 base 15+5·enemy），普通档在前线压力下仍会算出箭塔 > 金矿，破坏"普通档只升金矿"的 AC。**修复：普通档箭塔用低权重（8+2·enemy），困难档用高权重（15+5·enemy）；金矿 base 足够高（40 cap 20）使回本期分数稳定**。打分函数里 `if (this._difficulty === 'hard')` 分支决定公式。
 - **v2 VictorySystem.startWave 立即设 gameOver，但波浪动画仍能播放：** `startWave` 内 `this.gameOver = { winner, reason }` 立即执行，但 `tick()` 先检查 `if (this.wave)` 再检查 `if (this.gameOver)`，波浪存在时跳过 gameOver 短路。**注意：不要在 wave 活跃期额外检查 gameOver 来阻止波浪推进**。波浪在 WAVE_TICKS 后自清，此后 gameOver 才真正阻止后续 tick。
 - **v2 Node 提取 IIFE 测试必须用括号深度计数器定位结尾：** 从 HTML 提取 `(function testXxx(){...})()` 时，字符串搜索 `})()` 不可靠（注释或字符串里可能出现同样字符）。**修复：从左括号开始计数深度，depth=0 且下一字符是 `)` 时定位结尾；写临时 .js 文件执行，避免模板字符串与测试代码反引号冲突**。
+- **v2 dying 单位仍在 units 数组中，所有消费 units 的代码必须检查 `u.dying === undefined`：** 单位 HP 归零后不立即移除，而是标记 `dying = 4`（4 tick 死亡过渡动画）。dying 单位不计入人口、不参与战斗、不移动、不作为寻敌目标，但仍占据数组位置。**凡是遍历 `BarracksSystem.units` 的代码（人口统计 `getPopulationCount`、BarracksSystem CD 暂停、MoveUnits.tick、CombatSystem aliveUnits、selectTarget BFS）都必须跳过 `u.dying !== undefined` 的单位**。测试中不能断言 `units.length` 立即减少，应检查 `units.find(u => u.dying !== undefined)` 确认进入 dying 状态。
 
 ## Core Numbers
 

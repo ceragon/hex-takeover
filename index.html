@@ -461,9 +461,9 @@ const UnitTypes = {
 // ============================================================
 const BuildingTypes = {
   definitions: {
-    hq:              { hp: 1000, atk: 50, range: 6.5 },
-    archer_tower_50: { hp: 250,  atk: 35, range: 3.5 },
-    archer_tower_100:{ hp: 350,  atk: 50, range: 5.0 },
+    hq:              { hp: 1000, atk: 50, range: 3.0 },
+    archer_tower_50: { hp: 250,  atk: 35, range: 2.5 },
+    archer_tower_100:{ hp: 350,  atk: 50, range: 3.5 },
     gold_mine:       { hp: 150,  atk: 0,  range: 0   },
     barracks:        { hp: 200,  atk: 0,  range: 0   }
   },
@@ -500,6 +500,36 @@ const BarracksSystem = {
     delete this.timers[hexId]
   },
 
+  // 立即在指定兵营吐出一个单位（人口上限检查），返回 unit 或 null
+  spawnUnit(hexId, tiles, rng) {
+    const tile = tiles[hexId]
+    if (!tile || !tile.building || tile.building.type !== 'barracks') return null
+    // 人口上限（不含正在死亡的单位）
+    let pop = 0
+    for (const u of this.units) if (u.owner === tile.owner && !u.dying) pop++
+    if (pop >= POP_CAP) return null
+    const tier = tile.building.tier
+    const unitKey = UnitTypes.pickUnitForTier(tier, rng)
+    const unitDef = UnitTypes.get(unitKey)
+    const unit = {
+      key: unitKey,
+      tier: unitDef.tier,
+      owner: tile.owner,
+      hexId,
+      hp: unitDef.hp,
+      atk: unitDef.atk,
+      speed: unitDef.speed,
+      range: unitDef.range,
+      trait: unitDef.trait,
+      moveProgress: 0,
+      attackCd: 0
+    }
+    this.units.push(unit)
+    // 重置 timer，下次吐兵从 0 开始计 CD
+    this.timers[hexId] = 0
+    return unit
+  },
+
   tick(tiles, rng) {
     const spawned = []
     for (const hexId of Object.keys(this.timers)) {
@@ -508,34 +538,17 @@ const BarracksSystem = {
       if (tile.building.type !== 'barracks') continue
       if (tile.ruin) { this.destroyBarracks(hexId); continue }
 
-      const tier = tile.building.tier
-      const cdTicks = UnitTypes.tierToCd[tier] * 10
+      const cdTicks = UnitTypes.tierToCd[tile.building.tier] * 10
 
       // 人口上限：满员时暂停该兵营 CD（不增 timer），名额释放后从原进度恢复
       let pop = 0
-      for (const u of this.units) if (u.owner === tile.owner) pop++
+      for (const u of this.units) if (u.owner === tile.owner && !u.dying) pop++
       if (pop >= POP_CAP) continue
 
       this.timers[hexId] = (this.timers[hexId] || 0) + 1
       if (this.timers[hexId] >= cdTicks) {
-        this.timers[hexId] = 0
-        const unitKey = UnitTypes.pickUnitForTier(tier, rng)
-        const unitDef = UnitTypes.get(unitKey)
-        const unit = {
-          key: unitKey,
-          tier: unitDef.tier,
-          owner: tile.owner,
-          hexId,
-          hp: unitDef.hp,
-          atk: unitDef.atk,
-          speed: unitDef.speed,
-          range: unitDef.range,
-          trait: unitDef.trait,
-          moveProgress: 0,
-          attackCd: 0
-        }
-        this.units.push(unit)
-        spawned.push(unit)
+        const unit = this.spawnUnit(hexId, tiles, rng)
+        if (unit) spawned.push(unit)
       }
     }
     return spawned
@@ -987,15 +1000,25 @@ const CombatSystem = {
     if (best) {
       best.hp -= atk
       b.attackCd = this.ATTACK_CD
+      // 生成弹道视觉效果（纯渲染，伤害已即时结算）
+      if (typeof Projectiles !== 'undefined') {
+        Projectiles.spawn(hexId, best.hexId, tile.owner)
+      }
     }
   },
 
-  // 清理死亡单位 + 触发死亡粒子特效 + 建筑 HP 归零变废墟
+  // 清理死亡单位（标记 dying 倒计时，动画结束后移除）+ 建筑 HP 归零变废墟
   _cleanup(units, tiles) {
     for (let i = units.length - 1; i >= 0; i--) {
-      if (units[i].hp <= 0) {
-        if (typeof DeathEffect !== 'undefined') DeathEffect.spawn(units[i].hexId, units[i].owner)
+      const u = units[i]
+      // 倒计时结束，从数组中移除
+      if (u.dying !== undefined && u.dying <= 0) {
         units.splice(i, 1)
+        continue
+      }
+      // HP 归零且尚未进入死亡动画，标记 dying = 4 tick（0.4s 过渡）
+      if (u.hp <= 0 && u.dying === undefined) {
+        u.dying = 4
       }
     }
     for (const hexId of Object.keys(tiles)) {
@@ -1034,6 +1057,11 @@ const CombatSystem = {
   // 主 tick：递减 CD → 收集攻击（同步）→ 应用伤害 → 建筑攻击 → 清理
   tick(units, tiles) {
     for (const u of units) {
+      // 正在死亡的单位：递减倒计时，不参与战斗
+      if (u.dying !== undefined) {
+        u.dying--
+        continue
+      }
       if (u.hp > 0) u.attackCd = Math.max(0, (u.attackCd || 0) - 1)
       if (u.tier === 'gold' && u.attackCd === 0 && u.mode === 'melee') {
         u.mode = 'ranged'
@@ -1047,8 +1075,8 @@ const CombatSystem = {
       }
     }
 
-    // 单位攻击：先收集所有攻击事件，再统一应用（同步战斗）
-    const aliveUnits = units.filter(u => u.hp > 0)
+    // 单位攻击：先收集所有攻击事件，再统一应用（同步战斗）——排除正在死亡的单位
+    const aliveUnits = units.filter(u => u.hp > 0 && !u.dying)
     const pendingHits = []
     for (const u of aliveUnits) {
       if (u.attackCd > 0) continue
@@ -1149,7 +1177,7 @@ const MoveUnits = {
       const { q, r, dist } = queue.shift()
       if (dist > 0) {
         const hexId = `${q},${r}`
-        const eu = allUnits.find(u => u !== selfUnit && u.owner === enemy && u.hexId === hexId)
+        const eu = allUnits.find(u => u !== selfUnit && u.owner === enemy && u.hexId === hexId && u.dying === undefined)
         if (eu) return { type: 'unit', hexId, q, r }
         const tile = tiles[hexId]
         if (tile && tile.owner === enemy && tile.building) {
@@ -1175,7 +1203,7 @@ const MoveUnits = {
       const { q, r, dist } = queue.shift()
       if (dist > 0) {
         const hexId = `${q},${r}`
-        const eu = allUnits.find(u => u !== selfUnit && u.owner !== selfUnit.owner && u.hexId === hexId)
+        const eu = allUnits.find(u => u !== selfUnit && u.owner !== selfUnit.owner && u.hexId === hexId && u.dying === undefined)
         if (eu) return { type: 'unit', hexId, q, r }
       }
       const neighbors = HexGrid.getNeighbors(q, r)
@@ -1227,6 +1255,8 @@ const MoveUnits = {
 
   tick(units, tiles) {
     for (const unit of units) {
+      // 正在死亡的单位不移动
+      if (unit.dying !== undefined) continue
       const target = this.selectTarget(unit, units, tiles)
       if (!target) continue
 
@@ -1296,10 +1326,13 @@ const ClickHandler = {
       const spec = BuildingTypes.getSpec('barracks')
       tile.building = { type: 'barracks', tier: result.tier, hp: spec.hp, maxHp: spec.hp }
       BarracksSystem.registerBarracks(`${tile.q},${tile.r}`)
+      // 立即吐出第一个兵（同帧，满人口时跳过）
+      BarracksSystem.spawnUnit(`${tile.q},${tile.r}`, tiles, SeededRNG)
     } else if (result.type === 'unit_card') {
       const spec = BuildingTypes.getSpec('barracks')
       tile.building = { type: 'barracks', tier: result.tier, card: true, hp: spec.hp, maxHp: spec.hp }
       BarracksSystem.registerBarracks(`${tile.q},${tile.r}`)
+      BarracksSystem.spawnUnit(`${tile.q},${tile.r}`, tiles, SeededRNG)
     } else if (result.type === 'archer_tower') {
       const spec = BuildingTypes.getSpec('archer_tower', result.priceTier)
       tile.building = {
@@ -1537,25 +1570,28 @@ const AIBehavior = {
       TerritorySystem.owners[`${tile.q},${tile.r}`] = this.SIDE
       delete tile.icon
       delete tile.price
-      this._applyOpenResult(tile, result)
+      this._applyOpenResult(tile, result, tiles, rng)
       TileSystem.activateOpenableTiles(tiles, tile, rng)
     } else if (action.type === 'upgrade') {
       UpgradeSystem.upgrade(action.tile, this.SIDE)
     }
   },
 
-  _applyOpenResult(tile, result) {
+  _applyOpenResult(tile, result, tiles, rng) {
     if (result.type === 'empty') {
       tile.building = null
     } else if (result.type === 'barracks') {
       const spec = BuildingTypes.getSpec('barracks')
       tile.building = { type: 'barracks', tier: result.tier, hp: spec.hp, maxHp: spec.hp }
       BarracksSystem.registerBarracks(`${tile.q},${tile.r}`)
+      // 立即吐出第一个兵（同帧，满人口时跳过）
+      if (tiles && rng) BarracksSystem.spawnUnit(`${tile.q},${tile.r}`, tiles, rng)
     } else if (result.type === 'unit_card') {
       const spec = BuildingTypes.getSpec('barracks')
       tile.building = { type: 'barracks', tier: result.tier, card: true,
         hp: spec.hp, maxHp: spec.hp }
       BarracksSystem.registerBarracks(`${tile.q},${tile.r}`)
+      if (tiles && rng) BarracksSystem.spawnUnit(`${tile.q},${tile.r}`, tiles, rng)
     } else if (result.type === 'archer_tower') {
       const spec = BuildingTypes.getSpec('archer_tower', result.priceTier)
       tile.building = { type: 'archer_tower', priceTier: result.priceTier,
@@ -1569,47 +1605,39 @@ const AIBehavior = {
 }
 
 // ============================================================
-// DeathEffect: 单位死亡粒子特效（消散/爆炸，0.3-0.5 秒）
-// 每个死亡事件生成 8-20 个粒子，粒子向外扩散并逐渐透明
+// Projectiles: 箭塔/HQ 远程攻击弹道（纯视觉，伤害已即时结算）
+// 阵营色光点从发射建筑直线飞向目标，0.4s（4 tick）
 // ============================================================
-const DeathEffect = {
-  particles: [],
-  MAX_PARTICLES: 300,
-  MIN_PER_DEATH: 8,
-  MAX_PER_DEATH: 20,
+const Projectiles = {
+  list: [],
+  FLIGHT_TICKS: 4,
+  SIZE: 3,
 
   init() {
-    this.particles = []
+    this.list = []
   },
 
-  spawn(hexId, owner) {
-    const [q, r] = hexId.split(',').map(Number)
-    const { x, y } = HexGrid.axialToPixel(q, r)
-    const count = this.MIN_PER_DEATH +
-      Math.floor(Math.random() * (this.MAX_PER_DEATH - this.MIN_PER_DEATH + 1))
-    const room = this.MAX_PARTICLES - this.particles.length
-    const actual = Math.min(count, room)
-    for (let i = 0; i < actual; i++) {
-      const angle = Math.random() * Math.PI * 2
-      const speed = 1.5 + Math.random() * 3
-      this.particles.push({
-        x, y,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
-        life: 3 + Math.floor(Math.random() * 3),
-        maxLife: 5,
-        owner
-      })
-    }
+  spawn(fromHexId, toHexId, owner) {
+    const [fq, fr] = fromHexId.split(',').map(Number)
+    const [tq, tr] = toHexId.split(',').map(Number)
+    const from = HexGrid.axialToPixel(fq, fr)
+    const to = HexGrid.axialToPixel(tq, tr)
+    this.list.push({
+      x: from.x,
+      y: from.y,
+      tx: to.x,
+      ty: to.y,
+      progress: 0,
+      maxLife: this.FLIGHT_TICKS,
+      owner
+    })
   },
 
   tick() {
-    for (let i = this.particles.length - 1; i >= 0; i--) {
-      const p = this.particles[i]
-      p.x += p.vx
-      p.y += p.vy
-      p.life--
-      if (p.life <= 0) this.particles.splice(i, 1)
+    for (let i = this.list.length - 1; i >= 0; i--) {
+      const p = this.list[i]
+      p.progress++
+      if (p.progress >= p.maxLife) this.list.splice(i, 1)
     }
   },
 
@@ -1655,6 +1683,7 @@ function initGameState() {
   CombatSystem.init()
   VictorySystem.init()
   AIBehavior.init()
+  Projectiles.init()
 
   // 全图登记领地归属（含 inactive）
   for (const hexId of Object.keys(tiles)) {
@@ -1882,6 +1911,7 @@ function renderGrid() {
       let cornerBadge = '' // 右上角标（品阶/等级）
       let drawCastle = false
       let buildingEmoji = ''
+      let hqFont = false
 
       const ownerKey = tile.owner === 'player' ? 'player' : (tile.owner === 'ai' ? 'ai' : null)
 
@@ -1893,7 +1923,8 @@ function renderGrid() {
         color = ownerKey === 'player' ? TILE_COLORS.playerOpened : TILE_COLORS.aiOpened
         stroke = ownerKey === 'player' ? TILE_STROKES.playerOpened : TILE_STROKES.aiOpened
         if (tile.building.type === 'hq') {
-          drawCastle = true
+          buildingEmoji = '🏹'
+          hqFont = true
         } else if (tile.building.type === 'barracks') {
           buildingEmoji = BUILDING_EMOJI.barracks
           const tierMap = { green: '绿', blue: '蓝', purple: '紫', gold: '金' }
@@ -1946,7 +1977,7 @@ function renderGrid() {
         drawHQCastle(cx, cy, size)
       } else {
         if (buildingEmoji) {
-          ctx.font = '20px serif'
+          ctx.font = hqFont ? '30px serif' : '20px serif'
           ctx.textAlign = 'center'
           ctx.textBaseline = 'middle'
           ctx.fillText(buildingEmoji, cx, cy - 1)
@@ -2034,6 +2065,27 @@ function renderUnits() {
 
     const ux = cx + ox
     const uy = cy + oy - 8
+
+    // 死亡过渡动画：dying=4,3 闪白；dying=2,1 缩小+渐隐
+    let scale = 1
+    let alpha = 1
+    let flashWhite = false
+    if (unit.dying !== undefined) {
+      if (unit.dying >= 3) {
+        flashWhite = true
+      } else if (unit.dying > 0) {
+        scale = unit.dying / 2   // dying=2 → 1.0, dying=1 → 0.5
+        alpha = unit.dying / 2
+      }
+    }
+
+    ctx.save()
+    ctx.globalAlpha = alpha
+    if (scale !== 1) {
+      ctx.translate(ux, uy)
+      ctx.scale(scale, scale)
+      ctx.translate(-ux, -uy)
+    }
     // 阵营底色圆（提供所属信息）+ 兵种 emoji（负责兵种辨识）
     ctx.beginPath()
     ctx.arc(ux, uy, 9, 0, Math.PI * 2)
@@ -2046,6 +2098,14 @@ function renderUnits() {
     ctx.textAlign = 'center'
     ctx.textBaseline = 'middle'
     ctx.fillText(UNIT_EMOJI[unit.key] || '⚔️', ux, uy + 0.5)
+    // 闪白覆盖层
+    if (flashWhite) {
+      ctx.beginPath()
+      ctx.arc(ux, uy, 9, 0, Math.PI * 2)
+      ctx.fillStyle = 'rgba(255,255,255,0.75)'
+      ctx.fill()
+    }
+    ctx.restore()
   }
 }
 
@@ -2070,12 +2130,24 @@ function renderWave() {
   ctx.restore()
 }
 
-function renderDeathEffects() {
-  for (const p of DeathEffect.particles) {
-    const alpha = Math.max(0, p.life / p.maxLife)
-    const color = p.owner === 'player' ? `rgba(136,204,255,${alpha})` : `rgba(255,102,102,${alpha})`
+function renderProjectiles() {
+  for (const p of Projectiles.list) {
+    const t = p.progress / p.maxLife
+    const x = p.x + (p.tx - p.x) * t + RENDER_OFFSET.x
+    const y = p.y + (p.ty - p.y) * t + RENDER_OFFSET.y
+    const angle = Math.atan2(p.ty - p.y, p.tx - p.x)
+    const color = p.owner === 'player' ? '#88ccff' : '#ff6666'
+    ctx.save()
+    ctx.translate(x, y)
+    ctx.rotate(angle)
     ctx.fillStyle = color
-    ctx.fillRect(p.x + RENDER_OFFSET.x - 1, p.y + RENDER_OFFSET.y - 1, 2, 2)
+    ctx.beginPath()
+    ctx.moveTo(6, 0)
+    ctx.lineTo(-4, -3)
+    ctx.lineTo(-4, 3)
+    ctx.closePath()
+    ctx.fill()
+    ctx.restore()
   }
 }
 
@@ -2143,10 +2215,10 @@ function renderDifficultyScreen() {
   ctx.restore()
 }
 
-// 某一方当前存活的移动单位数（建筑不计入）——人口
+// 某一方当前存活的移动单位数（建筑不计入）——人口（不含正在死亡的单位）
 function getPopulationCount(owner) {
   let n = 0
-  for (const u of BarracksSystem.units) if (u.owner === owner) n++
+  for (const u of BarracksSystem.units) if (u.owner === owner && !u.dying) n++
   return n
 }
 
@@ -2317,7 +2389,7 @@ function render() {
   renderGrid()
   renderUnits()
   renderWave()
-  renderDeathEffects()
+  renderProjectiles()
   renderTopBar()
   renderBottomBar()
   renderNotification()
@@ -2430,7 +2502,7 @@ function renderUpgradePanel() {
 
 function restartGame() {
   VictorySystem.reset()
-  DeathEffect.reset()
+  Projectiles.reset()
   gameState = initGameState()
   tickCount = 0
   _upgradeTile = null
@@ -2532,7 +2604,7 @@ const gameLoop = createGameLoop(() => {
     CombatSystem.tick(BarracksSystem.units, gameState.tiles)
     AIBehavior.tick(gameState.tiles, SeededRNG)
   }
-  DeathEffect.tick()
+  Projectiles.tick()
   render()
 })
 
@@ -3676,11 +3748,11 @@ render()
   // === 1. BuildingTypes spec 查询 ===
   console.assert(BuildingTypes.getSpec('hq').hp === 1000, 'HQ hp=1000')
   console.assert(BuildingTypes.getSpec('hq').atk === 50, 'HQ atk=50')
-  console.assert(BuildingTypes.getSpec('hq').range === 6.5, 'HQ range=6.5')
+  console.assert(BuildingTypes.getSpec('hq').range === 3.0, 'HQ range=3.0')
   console.assert(BuildingTypes.getSpec('archer_tower', 50).hp === 250, 'tower 50 hp=250')
-  console.assert(BuildingTypes.getSpec('archer_tower', 50).range === 3.5, 'tower 50 range=3.5')
+  console.assert(BuildingTypes.getSpec('archer_tower', 50).range === 2.5, 'tower 50 range=2.5')
   console.assert(BuildingTypes.getSpec('archer_tower', 100).hp === 350, 'tower 100 hp=350')
-  console.assert(BuildingTypes.getSpec('archer_tower', 100).range === 5.0, 'tower 100 range=5.0')
+  console.assert(BuildingTypes.getSpec('archer_tower', 100).range === 3.5, 'tower 100 range=3.5')
   console.assert(BuildingTypes.getSpec('gold_mine').hp === 150, 'gold_mine hp=150')
   console.assert(BuildingTypes.getSpec('barracks').hp === 200, 'barracks hp=200')
 
@@ -3761,7 +3833,9 @@ render()
   ]
   CombatSystem.tick(u6, t6)
   const dmgGoldSplash = Math.round(CombatSystem.calcDamage(60, 'gold', 'green') * 0.5)
-  console.assert(u6.length === 3, `wolf@4,4 one-shot removed, got ${u6.length} units`)
+  // wolf@4,4 hp=80 被 AOE 击杀，进入 dying 状态（不再立即移除）
+  const deadWolf6 = u6.find(u => u.hexId === '4,4' && u.dying !== undefined)
+  console.assert(deadWolf6 && deadWolf6.hp <= 0, `wolf@4,4 应被击杀并进入 dying 状态`)
   const sk6 = u6.find(u => u.hexId === '4,3')
   console.assert(sk6 && sk6.hp === 300 - dmgGoldSplash,
     `splash onto skeleton should deal ${dmgGoldSplash}, hp=${sk6 && sk6.hp}`)
@@ -3791,7 +3865,7 @@ render()
   console.assert(u8[0].mode === 'ranged', 'gold switches to ranged when CD reaches 0')
   console.assert(u8[0].attackCd === 0, 'attackCd should be 0')
 
-  // === 9. 50 金箭塔：射程 3.5 / ATK 35 ===
+  // === 9. 50 金箭塔：射程 2.5 / ATK 35 ===
   const t9 = freshTiles(); resetAll()
   t9['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened',
     building: { type: 'archer_tower', priceTier: 50, hp: 250, maxHp: 250 } }
@@ -3802,27 +3876,27 @@ render()
   CombatSystem.tick(u9, t9)
   console.assert(u9[0].hp === 120 - 35, `tower 50 deals 35, hp=${u9[0].hp}`)
 
-  // === 10. 100 金箭塔：射程 5.0 / ATK 50 ===
+  // === 10. 100 金箭塔：射程 3.5 / ATK 50 ===
   const t10 = freshTiles(); resetAll()
   t10['4,5'] = { q: 4, r: 5, owner: 'player', state: 'opened',
     building: { type: 'archer_tower', priceTier: 100, hp: 350, maxHp: 350 } }
-  t10['4,1'] = { q: 4, r: 1, owner: 'ai', state: 'opened' }
+  t10['4,8'] = { q: 4, r: 8, owner: 'ai', state: 'opened' }
   const u10 = [
-    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,1', hp: 120, atk: 15, speed: 0.4, range: 1.2, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
+    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,8', hp: 120, atk: 15, speed: 0.4, range: 1.2, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
   ]
   CombatSystem.tick(u10, t10)
-  console.assert(u10[0].hp === 120 - 50, `tower 100 at 4 hex deals 50, hp=${u10[0].hp}`)
+  console.assert(u10[0].hp === 120 - 50, `tower 100 at 3 hex deals 50, hp=${u10[0].hp}`)
 
-  // === 11. HQ 射程 6.5 / ATK 50 ===
+  // === 11. HQ 射程 3.0 / ATK 50 ===
   const t11 = freshTiles(); resetAll()
   t11['4,11'] = { q: 4, r: 11, owner: 'player', state: 'opened',
     building: { type: 'hq', hp: 1000, maxHp: 1000 } }
-  t11['4,5'] = { q: 4, r: 5, owner: 'ai', state: 'opened' }
+  t11['4,9'] = { q: 4, r: 9, owner: 'ai', state: 'opened' }
   const u11 = [
-    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,5', hp: 120, atk: 15, speed: 0.4, range: 1.2, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
+    { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,9', hp: 120, atk: 15, speed: 0.4, range: 1.2, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
   ]
   CombatSystem.tick(u11, t11)
-  console.assert(u11[0].hp === 120 - 50, `HQ at 6 hex deals 50, hp=${u11[0].hp}`)
+  console.assert(u11[0].hp === 120 - 50, `HQ at 2 hex deals 50, hp=${u11[0].hp}`)
 
   // === 12. 建筑 HP 归零变废墟 + 领地变色 ===
   const t12 = freshTiles(); resetAll()
@@ -3858,7 +3932,11 @@ render()
     { key: 'skeleton', tier: 'green', owner: 'ai', hexId: '4,4', hp: 10, atk: 15, speed: 0.4, range: 0, trait: 'melee_tanky', moveProgress: 0, attackCd: 10 }
   ]
   CombatSystem.tick(u14, t14)
-  console.assert(u14.length === 1, `dead unit removed, got ${u14.length}`)
+  // 死亡单位进入 dying 状态（hp=0, dying=4），5 ticks 后才真正移除
+  console.assert(u14.length === 2, `dead unit should still be in array (dying), got ${u14.length}`)
+  console.assert(u14[1].dying === 4, `dead unit dying should be 4, got ${u14[1].dying}`)
+  for (let i = 0; i < 4; i++) CombatSystem.tick(u14, t14)
+  console.assert(u14.length === 1, `dead unit removed after 5 ticks, got ${u14.length}`)
   console.assert(u14[0].tier === 'gold', 'survivor is gold')
 
   // === 15. 攻击 CD 1 次/秒（10 ticks）===
@@ -3970,7 +4048,7 @@ render()
 
   // === 2. 50 金箭塔三档成本 ===
   const at50 = { owner: 'player', state: 'opened',
-    building: { type: 'archer_tower', priceTier: 50, hp: 250, maxHp: 250, atk: 35, range: 3.5, level: 0 } }
+    building: { type: 'archer_tower', priceTier: 50, hp: 250, maxHp: 250, atk: 35, range: 2.5, level: 0 } }
   console.assert(UpgradeSystem.getCost(at50) === 30, `tower 50 L0 cost 30, got ${UpgradeSystem.getCost(at50)}`)
   at50.building.level = 1
   console.assert(UpgradeSystem.getCost(at50) === 60, `tower 50 L1 cost 60, got ${UpgradeSystem.getCost(at50)}`)
@@ -3981,7 +4059,7 @@ render()
 
   // === 3. 100 金箭塔三档成本 ===
   const at100 = { owner: 'player', state: 'opened',
-    building: { type: 'archer_tower', priceTier: 100, hp: 350, maxHp: 350, atk: 50, range: 5.0, level: 0 } }
+    building: { type: 'archer_tower', priceTier: 100, hp: 350, maxHp: 350, atk: 50, range: 3.5, level: 0 } }
   console.assert(UpgradeSystem.getCost(at100) === 50, `tower 100 L0 cost 50, got ${UpgradeSystem.getCost(at100)}`)
   at100.building.level = 2
   console.assert(UpgradeSystem.getCost(at100) === 200, `tower 100 L2 cost 200, got ${UpgradeSystem.getCost(at100)}`)
@@ -4024,12 +4102,12 @@ render()
   ResourceSystem.init()
   ResourceSystem.gold.player = 200
   const atUp = { owner: 'player', state: 'opened',
-    building: { type: 'archer_tower', priceTier: 50, hp: 250, maxHp: 250, atk: 35, range: 3.5, level: 0 } }
+    building: { type: 'archer_tower', priceTier: 50, hp: 250, maxHp: 250, atk: 35, range: 2.5, level: 0 } }
   const r9 = UpgradeSystem.upgrade(atUp, 'player')
   console.assert(r9.ok && r9.newLevel === 1, 'tower 50 upgrade L0→L1')
   console.assert(atUp.building.atk === 49, `tower L1 atk=49 (35×1.4), got ${atUp.building.atk}`)
-  console.assert(Math.abs(atUp.building.range - 4.0) < 0.01,
-    `tower L1 range=4.0, got ${atUp.building.range}`)
+  console.assert(Math.abs(atUp.building.range - 3.0) < 0.01,
+    `tower L1 range=3.0, got ${atUp.building.range}`)
   console.assert(atUp.building.maxHp === 300, `tower L1 maxHp=300 (250×1.2), got ${atUp.building.maxHp}`)
 
   // === 10. 满级后 upgrade 返回 cannot_upgrade ===
@@ -4367,7 +4445,7 @@ render()
     building: { type: 'gold_mine', hp: 150, maxHp: 150, level: 0 } }
   t9['5,1'] = { q: 5, r: 1, owner: 'ai', state: 'opened',
     building: { type: 'archer_tower', priceTier: 50, hp: 250, maxHp: 250,
-      atk: 35, range: 3.5, level: 0 } }
+      atk: 35, range: 2.5, level: 0 } }
   t9['5,2'] = { q: 5, r: 2, owner: 'player', state: 'opened' }
   t9['4,2'] = { q: 4, r: 2, owner: 'player', state: 'opened' }
   t9['6,2'] = { q: 6, r: 2, owner: 'player', state: 'opened' }
@@ -4408,91 +4486,64 @@ render()
 })()
 
 // ============================================================
-// testDeathEffect: 粒子生命周期（生成 → 扩散 → 消失）
+// testProjectiles: 弹道生命周期（生成 → 飞行 → 消失）
 // ============================================================
-;(function testDeathEffect() {
+;(function testProjectiles() {
   function resetAll() {
-    DeathEffect.init()
+    Projectiles.init()
   }
 
-  // --- init 后粒子数组为空 ---
+  // --- init 后 list 为空 ---
   resetAll()
-  console.assert(Array.isArray(DeathEffect.particles), 'particles 应是数组')
-  console.assert(DeathEffect.particles.length === 0, 'init 后 particles 应为空')
+  console.assert(Array.isArray(Projectiles.list), 'list 应是数组')
+  console.assert(Projectiles.list.length === 0, 'init 后 list 应为空')
 
-  // --- spawn 生成 8-20 个粒子 ---
+  // --- spawn 生成一个弹道 ---
   resetAll()
-  DeathEffect.spawn('4,5', 'player')
-  const count1 = DeathEffect.particles.length
-  console.assert(count1 >= 8 && count1 <= 20,
-    `spawn 应生成 8-20 个粒子，实际 ${count1}`)
+  Projectiles.spawn('4,5', '4,3', 'player')
+  console.assert(Projectiles.list.length === 1, `spawn 应生成 1 个弹道，实际 ${Projectiles.list.length}`)
 
-  // --- 粒子属性完整 ---
-  const p0 = DeathEffect.particles[0]
-  console.assert(typeof p0.x === 'number' && typeof p0.y === 'number', '粒子应有 x/y 数值')
-  console.assert(typeof p0.vx === 'number' && typeof p0.vy === 'number', '粒子应有 vx/vy 数值')
-  console.assert(typeof p0.life === 'number' && p0.life > 0, '粒子 life 应 > 0')
-  console.assert(typeof p0.maxLife === 'number' && p0.maxLife >= 3 && p0.maxLife <= 5,
-    `maxLife 应在 3-5 ticks，实际 ${p0.maxLife}`)
+  // --- 弹道属性完整 ---
+  const p0 = Projectiles.list[0]
+  console.assert(typeof p0.x === 'number' && typeof p0.y === 'number', '弹道应有 x/y 数值')
+  console.assert(typeof p0.tx === 'number' && typeof p0.ty === 'number', '弹道应有 tx/ty 目标')
+  console.assert(p0.progress === 0, `progress 应为 0，实际 ${p0.progress}`)
+  console.assert(p0.maxLife === 4, `maxLife 应为 4，实际 ${p0.maxLife}`)
   console.assert(p0.owner === 'player', `owner 应是 'player'，实际 ${p0.owner}`)
 
-  // --- 粒子初始位置在 hex 中心附近（像素坐标） ---
-  const hexPx = HexGrid.axialToPixel(4, 5)
-  const distFromCenter = Math.hypot(p0.x - hexPx.x, p0.y - hexPx.y)
-  console.assert(distFromCenter < 5,
-    `粒子应靠近 hex 中心，距离 ${distFromCenter.toFixed(2)}`)
-
-  // --- tick 递减 life ---
+  // --- tick 递增 progress ---
   resetAll()
-  DeathEffect.spawn('2,3', 'ai')
-  const lifeBefore = DeathEffect.particles[0].life
-  DeathEffect.tick()
-  const lifeAfter = DeathEffect.particles[0].life
-  console.assert(lifeAfter === lifeBefore - 1,
-    `tick 应递减 life 1，从 ${lifeBefore} 到 ${lifeAfter}`)
+  Projectiles.spawn('2,3', '5,6', 'ai')
+  Projectiles.tick()
+  console.assert(Projectiles.list[0].progress === 1, `tick 后 progress 应为 1，实际 ${Projectiles.list[0].progress}`)
 
-  // --- tick 移动粒子位置 ---
+  // --- 飞行结束后移除 ---
   resetAll()
-  DeathEffect.spawn('0,0', 'player')
-  const pp = DeathEffect.particles[0]
-  const xBefore = pp.x
-  const yBefore = pp.y
-  DeathEffect.tick()
-  console.assert(pp.x !== xBefore || pp.y !== yBefore,
-    'tick 后粒子位置应改变')
+  Projectiles.spawn('1,1', '3,3', 'player')
+  for (let i = 0; i < 4; i++) Projectiles.tick()
+  console.assert(Projectiles.list.length === 0,
+    `4 ticks 后弹道应消失，剩余 ${Projectiles.list.length}`)
 
-  // --- 过期粒子被移除 ---
+  // --- 多次 spawn 叠加 ---
   resetAll()
-  DeathEffect.spawn('1,1', 'player')
-  const spawnCount = DeathEffect.particles.length
-  for (let i = 0; i < 10; i++) DeathEffect.tick()
-  console.assert(DeathEffect.particles.length === 0,
-    `10 ticks 后所有粒子应消失，剩余 ${DeathEffect.particles.length}`)
+  Projectiles.spawn('0,0', '1,1', 'player')
+  Projectiles.spawn('2,2', '3,3', 'ai')
+  console.assert(Projectiles.list.length === 2, '两次 spawn 应有 2 个弹道')
 
-  // --- 多个死亡事件叠加 ---
+  // --- 部分弹道过期，其他保留 ---
   resetAll()
-  DeathEffect.spawn('0,0', 'player')
-  DeathEffect.spawn('1,1', 'ai')
-  const c1 = DeathEffect.particles.filter(p => p.owner === 'player').length
-  const c2 = DeathEffect.particles.filter(p => p.owner === 'ai').length
-  console.assert(c1 >= 8 && c2 >= 8,
-    `两次 spawn 应各自生成 ≥8 粒子，player=${c1}, ai=${c2}`)
-  console.assert(DeathEffect.particles.length === c1 + c2,
-    '总粒子数应是两次 spawn 之和')
+  Projectiles.spawn('0,0', '1,1', 'player')
+  Projectiles.tick()
+  Projectiles.tick()
+  Projectiles.spawn('2,2', '3,3', 'ai')
+  for (let i = 0; i < 2; i++) Projectiles.tick()
+  // 第一个弹道 progress=4 应已移除，第二个 progress=2 应保留
+  console.assert(Projectiles.list.length === 1,
+    `第一批弹道应消失，第二批应保留，剩余 ${Projectiles.list.length}`)
+  console.assert(Projectiles.list[0].owner === 'ai',
+    `保留的应是 ai 弹道，实际 ${Projectiles.list[0].owner}`)
 
-  // --- 部分粒子过期，其他保留 ---
-  resetAll()
-  DeathEffect.spawn('0,0', 'player')
-  DeathEffect.tick()
-  DeathEffect.tick()
-  DeathEffect.spawn('2,2', 'ai')
-  const beforeCount = DeathEffect.particles.length
-  for (let i = 0; i < 5; i++) DeathEffect.tick()
-  const aiRemaining = DeathEffect.particles.filter(p => p.owner === 'ai').length
-  console.assert(aiRemaining === 0,
-    `第二批 ai 粒子 5 ticks 后应全部消失，剩余 ${aiRemaining}`)
-
-  console.log('[test] DeathEffect tests passed (7 cases)')
+  console.log('[test] Projectiles tests passed (7 cases)')
 })()
 
 // ============================================================
